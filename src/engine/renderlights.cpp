@@ -4642,8 +4642,7 @@ void rendercsmshadowmaps()
 
     findshadowvas(smalpha && alphashadow);
     if(shadowtransparent || envshadow) csm.rendered = 2;
-    if(rtworld) clearshadowmms(); // map models are traced along with the world
-    else findshadowmms();
+    findshadowmms();
 
     shadowmaskbatchedmodels(smdynshadow!=0);
     batchshadowmapmodels();

@@ -33,10 +33,11 @@ float rnd(inout uint seed)
     return float(seed) * (1.0/4294967296.0);
 }
 
-bool occluded(vec3 o, vec3 d, float tmax)
+// instance masks: 1 the world, 2 map models
+bool occluded(vec3 o, vec3 d, float tmax, uint mask)
 {
     rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF, o, 0.0, d, tmax);
+    rayQueryInitializeEXT(rq, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, mask, o, 0.0, d, tmax);
     while(rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -77,7 +78,7 @@ void main()
             // cosine weighted over the hemisphere
             float r1 = rnd(seed), r2 = rnd(seed), r = sqrt(r1), phi = 6.28318531*r2;
             vec3 d = normalize(t*(r*cos(phi)) + b*(r*sin(phi)) + n*sqrt(max(1.0 - r1, 0.0)));
-            if(occluded(o, d, pc.params.x)) hits += 1.0;
+            if(occluded(o, d, pc.params.x, 0xFFu)) hits += 1.0;
         }
         ao = 1.0 - hits/float(rays);
     }
@@ -93,7 +94,7 @@ void main()
             basis(pc.sun.xyz, t, b);
             float r = sqrt(rnd(seed))*pc.sun.w, phi = 6.28318531*rnd(seed);
             vec3 d = normalize(pc.sun.xyz + t*(r*cos(phi)) + b*(r*sin(phi)));
-            sun = occluded(o, d, 1.0e6) ? 0.0 : 1.0;
+            sun = occluded(o, d, 1.0e6, 0x01u) ? 0.0 : 1.0; // map models shadow through the shadow map
         }
     }
 

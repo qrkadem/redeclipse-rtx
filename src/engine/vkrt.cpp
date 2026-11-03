@@ -13,8 +13,8 @@ static const uint32_t rtfilterspv[] =
 #include "vkshaders/rtfilter.spv.h"
 ;
 
-VARF(IDF_PERSIST, rtao, 0, 0, 1, cleardeferredlightshaders());  // ray traced ambient occlusion
-VARF(IDF_PERSIST, rtsun, 0, 0, 1, cleardeferredlightshaders()); // ray traced sun shadows
+VARF(IDF_PERSIST, rtao, 0, 1, 1, cleardeferredlightshaders());  // ray traced ambient occlusion, when the card can trace
+VARF(IDF_PERSIST, rtsun, 0, 1, 1, cleardeferredlightshaders()); // ray traced sun shadows, when the card can trace
 FVAR(IDF_PERSIST, rtaoradius, 1, 12, 512);  // how far occluders count, in world units
 VAR(IDF_PERSIST, rtaorays, 1, 2, 16);       // ambient occlusion rays per pixel each frame
 FVAR(IDF_PERSIST, rtsunsize, 0, 0.5f, 10);  // the sun's radius in degrees, larger gives softer shadows
@@ -422,7 +422,7 @@ namespace vk
                 VkAccelerationStructureInstanceKHR &mi = insts.add();
                 memset(&mi, 0, sizeof(mi));
                 mapmodeltransform(e, mi.transform);
-                mi.mask = 0xFF;
+                mi.mask = 0x02; // ambient occlusion only: the sun's shadow map keeps map models, alpha tested leaves and all
                 mi.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
                 mi.accelerationStructureReference = rm->blas.addr;
                 modeltris += rm->tris;
@@ -571,6 +571,8 @@ using namespace vk;
 
 static string rtdumpname = "";
 ICOMMAND(0, rtdump, "s", (char *name), copystring(rtdumpname, *name ? name : "rtdump"));
+
+ICOMMANDV(0, rtavailable, vkactive && hasrt ? 1 : 0);
 
 bool vkrt_aoavailable() { return rtao && vkactive && hasrt && !rtfailed; }
 bool vkrt_sunavailable() { return rtsun && vkactive && hasrt && !rtfailed; }

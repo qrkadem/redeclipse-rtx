@@ -14,7 +14,7 @@ VAR(IDF_INIT, vkvalidation, 0, 0, 1); // Khronos validation layer, for developme
 VAR(0, dbgvk, 0, 0, 1);
 
 bool vkactive = false;
-extern int dlssg;
+extern int dlssg, refreshrate;
 
 #define MAXVKFRAMES 2 // screen images GL and Vulkan take turns with
 
@@ -561,7 +561,23 @@ namespace vk
     static vector<presentjob> presentjobs;
     static bool presentquit = false;
     static bool slotbusy[MAXVKFRAMES];
-    static double lastjobtime = 0, jobinterval = 0;
+    static double lastjobtime = 0, jobinterval = 0, lastcputime = 0, workinterval = 0;
+    static int fgauto = 1, fgautonext = 1, fgautoframes = 0, fglastgen = 0;
+
+    // automatic frame generation: the fewest generated frames that reach the refresh rate from how fast the game
+    // could render, which is the processor time the main thread spends on a frame: blocking in the driver or waiting
+    // for presenting costs none, so it holds when vsync and frame generation slow the frames down
+    static int autogen(int maxgen)
+    {
+        if(workinterval <= 0) return min(fgauto, maxgen);
+        double fps = 1.0/workinterval, target = 0.95*(refreshrate > 0 ? refreshrate : 60);
+        int want = clamp(int(ceil(target/fps)) - 1, 1, maxgen);
+        // a change has to hold for half a second, so the count doesn't flicker
+        if(want == fgauto) fgautoframes = 0;
+        else if(want != fgautonext) { fgautonext = want; fgautoframes = 0; }
+        else if(++fgautoframes*workinterval >= 0.5) { fgauto = want; fgautoframes = 0; }
+        return min(fgauto, maxgen);
+    }
     static vector<float> presenttimes; // milliseconds between presents, for presenttimes
     static double lastpresent = 0;
 
@@ -934,6 +950,7 @@ namespace vk
     static bool createframes(int w, int h, int fgw, int fgh)
     {
         bool wantfg = dlssg && ngx_fgmaxgen() > 0 && fgw > 0 && fgh > 0;
+        int numinterp = min(dlssg < 0 ? ngx_fgmaxgen() : int(dlssg), MAXFGGEN); // automatic makes room for the most
         loopi(MAXVKFRAMES)
         {
             screenframe &f = frames[i];
@@ -945,7 +962,7 @@ namespace vk
                 if(!createsharedimage(f.mvec, fgw, fgh, VK_FORMAT_R16G16_SFLOAT, GL_RG16F) ||
                    !createsharedimage(f.depth, fgw, fgh, VK_FORMAT_R32_SFLOAT, GL_R32F) ||
                    !createframebuffer(f.fgfbo, f.mvec, &f.depth)) return false;
-                loopj(min(int(dlssg), MAXFGGEN))
+                loopj(numinterp)
                     if(!createdeviceimage(f.interp[j], w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
                         return false;
             }
@@ -1237,7 +1254,9 @@ namespace vk
 using namespace vk;
 
 // DLSS frame generation: how many frames to make between rendered frames, 0 is off
-VARF(IDF_PERSIST, dlssg, 0, 0, MAXFGGEN, { if(vkactive) framesdirty = true; });
+// -1 picks the count itself: the fewest that bring the presented rate up to the display's refresh rate
+VARF(IDF_PERSIST, dlssg, -1, 0, MAXFGGEN, { if(vkactive) framesdirty = true; });
+ICOMMANDV(0, vkpresenting, vkactive ? 1 : 0);
 VAR(0, dbgvkfg, 0, 0, 1); // prints the range of the frame generation inputs each frame
 
 SDL_Window *vk_createwindow(const char *caption, int x, int y, int w, int h, int flags)
@@ -1470,7 +1489,7 @@ bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, const matri
 void vk_capturefg()
 {
     if(!vkactive || framedone || drawtex) return;
-    bool want = dlssg && ngx_fgmaxgen() > 0;
+    bool want = dlssg != 0 && ngx_fgmaxgen() > 0;
     if(want != fgimages)
     {
         framesdirty = true; // the screen images get made again with or without the inputs at the next frame
@@ -1565,7 +1584,10 @@ void vk_present()
 {
     if(!numframes || framedone) return;
     screenframe &f = frames[curframe];
-    int numgen = f.hasfg ? min(int(dlssg), ngx_fgmaxgen()) : 0;
+    int maxgen = 0;
+    while(maxgen < MAXFGGEN && f.interp[maxgen].image) maxgen++;
+    maxgen = min(maxgen, ngx_fgmaxgen());
+    int numgen = f.hasfg ? (dlssg < 0 ? autogen(maxgen) : min(int(dlssg), maxgen)) : 0;
     if(!f.hasfg) fgprevvalid = false; // the next frame generation starts over
 
     GLuint texs[4];
@@ -1602,6 +1624,7 @@ void vk_present()
         in.depth = &f.depth;
         in.interp = f.interp;
         in.camera = f.camera;
+        if(!fglastgen) in.camera.reset = true; // its last pair of frames is stale after a frame without it
         if(!ngx_fgevaluate(cmd, in, numgen)) numgen = 0;
         loopi(numgen) imagebarrier(cmd, f.interp[i].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -1632,14 +1655,21 @@ void vk_present()
     VkResult r = submit(si, f.fence);
     if(r != VK_SUCCESS) fatal("Vulkan: submitting the frame failed: %s", resultname(r));
 
+    fglastgen = numgen;
+
     // rendered frames come this far apart, the generated ones go out in between
     double now = seconds();
+    struct timespec cpu;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
+    double cputime = cpu.tv_sec + cpu.tv_nsec*1e-9;
     if(lastjobtime > 0)
     {
-        double dt = clamp(now - lastjobtime, 0.0, 0.1);
+        double dt = clamp(now - lastjobtime, 0.0, 0.1), work = clamp(cputime - lastcputime, 0.001, 0.1);
         jobinterval = jobinterval > 0 ? jobinterval + (dt - jobinterval)*0.1 : dt;
+        workinterval = workinterval > 0 ? workinterval + (work - workinterval)*0.05 : work;
     }
     lastjobtime = now;
+    lastcputime = cputime;
 
     presentjob job;
     job.slot = curframe;
@@ -1698,5 +1728,5 @@ ICOMMAND(0, vkinfo, "", (),
     if(!vkactive) { conoutf(colourwhite, "Vulkan: off, GL presents"); return; }
     conoutf(colourwhite, "Vulkan: %s, swapchain %ux%u %s, screen images %dx%d, ray queries %s, frame generation %s", devprops.deviceName,
         swapextent.width, swapextent.height, presentmodename(presentmode), numframes ? frames[0].img.w : 0, numframes ? frames[0].img.h : 0,
-        hasrt ? "on" : "off", fgimages ? tempformatstring("%dx (inputs %dx%d)", int(dlssg)+1, frames[0].mvec.w, frames[0].mvec.h) : "off");
+        hasrt ? "on" : "off", fgimages ? tempformatstring("%s%dx (inputs %dx%d, the game could render %.0f fps)", dlssg < 0 ? "auto " : "", (dlssg < 0 ? fglastgen : int(dlssg))+1, frames[0].mvec.w, frames[0].mvec.h, workinterval > 0 ? 1/workinterval : 0.0) : "off");
 });
