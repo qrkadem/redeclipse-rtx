@@ -702,25 +702,30 @@ void saveslotconfig(stream *h, Slot &s, int index, bool decal)
 
     lasttexgroup = s.group;
 
-    if(index >= 0 && s.shader)
+    // a slot a texture replacement defined is saved as the map defined it
+    bool orig = !s.origsts.empty();
+    Shader *shader = orig ? s.origshader : s.shader;
+    const vector<SlotShaderParam> &params = orig ? s.origparams : s.params;
+    const vector<Slot::Tex> &sts = orig ? s.origsts : s.sts;
+    if(index >= 0 && shader)
     {
-        h->printf("setshader %s\n", escapeid(s.shader->name));
-        loopvj(s.params)
+        h->printf("setshader %s\n", escapeid(shader->name));
+        loopvj(params)
         {
-            h->printf("setshaderparam %s", escapeid(s.params[j].name));
-            loopk(4) h->printf(" %f", s.params[j].val[k]);
-            if(s.params[j].palette || s.params[j].palindex) h->printf(" %d %d", s.params[j].palette, s.params[j].palindex);
+            h->printf("setshaderparam %s", escapeid(params[j].name));
+            loopk(4) h->printf(" %f", params[j].val[k]);
+            if(params[j].palette || params[j].palindex) h->printf(" %d %d", params[j].palette, params[j].palindex);
             h->printf("\n");
         }
     }
-    loopvj(s.sts)
+    loopvj(sts)
     {
         h->printf("texture");
         if(decal && !j) h->printf(" decal");
-        else if(index >= 0) h->printf(" %s", findtexturetypename(s.sts[j].type));
+        else if(index >= 0) h->printf(" %s", findtexturetypename(sts[j].type));
         else if(!j) h->printf(" %s", findmaterialname(-index));
         else h->printf(" 1");
-        h->printf(" %s", escapestring(s.sts[j].name));
+        h->printf(" %s", escapestring(sts[j].name));
         if(!j && index >= 0) h->printf(" // %d", index);
         h->printf("\n");
     }
@@ -1676,16 +1681,21 @@ bool load_world(const char *mname, int crc, int variant, stream *snapmap, const 
         convertblendmap();
         // bring the blend layers up to date, as a map saved without its lighting has none and one saved after a preview
         // or an older build may have them wrong, so every player has the same layers whatever they do in blend paint mode
+        loadstep(NULL);
         calcblendsurfaces(ivec(0, 0, 0), ivec(worldsize, worldsize, worldsize));
         entitiesinoctanodes();
         initlights();
+        loadstep("blend surfaces and lights");
         allchanged(true);
 
         progress(0, "Preloading textures..");
+        loadstep(NULL);
         preloadtextures(IDF_GAMEPRELOAD);
+        loadstep("preloadtextures");
 
         progress(0, "Starting map..");
         game::startmap();
+        loadstep("startmap");
         maploading = 0;
         return true;
     }

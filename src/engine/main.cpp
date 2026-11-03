@@ -976,6 +976,31 @@ VAR(IDF_PERSIST, maxfpsrefreshoffset, 0, 1, VAR_MAX);
 
 #define GETFPS(a) (a >= 0 ? a : int((refreshrate*a##refresh)+a##refreshoffset))
 
+// development aid: "frames average-ms worst-ms 1%-low-fps" of the frames drawn since the last call, timed swap to swap
+static Uint64 benchlastticks = 0;
+static vector<float> benchframetimes;
+static void benchframe()
+{
+    Uint64 now = SDL_GetPerformanceCounter();
+    if(benchlastticks && benchframetimes.length() < 100000)
+        benchframetimes.add(float(double(now - benchlastticks) * 1000.0 / double(SDL_GetPerformanceFrequency())));
+    benchlastticks = now;
+}
+static void frametimes()
+{
+    int n = benchframetimes.length();
+    if(!n) { result("0 0 0 0"); return; }
+    double total = 0;
+    loopi(n) total += benchframetimes[i];
+    benchframetimes.sort();
+    float worst = benchframetimes.last();
+    float low = benchframetimes[clamp(int(n*0.99f), 0, n-1)];
+    defformatstring(str, "%d %.3f %.3f %.1f", n, total/n, worst, low > 0 ? 1000.0f/low : 0.0f);
+    benchframetimes.setsize(0);
+    result(str);
+}
+COMMAND(0, frametimes, "");
+
 void limitfps(int &millis, int curmillis)
 {
     int curmax = GETFPS(maxfps), curmenu = GETFPS(menufps),
@@ -1506,7 +1531,9 @@ int main(int argc, char **argv)
             {
                 RUNMAP("on_update");
                 updateworldcols();
+                timer *gametimer = begintimer("Game Update", false);
                 game::updateworld();
+                endtimer(gametimer);
 
                 game::recomputecamera();
                 setviewcell(camera1->o);
@@ -1515,7 +1542,9 @@ int main(int argc, char **argv)
 
                 cleardynlights();
 
+                timer *fxtimer = begintimer("FX Update", false);
                 fx::update();
+                endtimer(fxtimer);
                 updatewind();
                 UI::update();
                 updatetextures();
@@ -1533,10 +1562,15 @@ int main(int argc, char **argv)
                         cleardynlights();
                     }
 
+                    timer *drawtimer = begintimer("Draw Frame", false);
                     gl_drawframe();
+                    endtimer(drawtimer);
                     renderedframe = true;
+                    timer *swaptimer = begintimer("Swap", false);
                     swapbuffers();
+                    endtimer(swaptimer);
                     inbetweenframes = true;
+                    benchframe();
 
                     if(pixeling)
                     {

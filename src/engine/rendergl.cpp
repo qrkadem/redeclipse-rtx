@@ -874,6 +874,8 @@ struct timer
     GLuint query[MAXQUERY];
     int waiting;
     uint starttime;
+    Uint64 startticks; // cpu timers count in the high resolution clock, as most of what they time is under a millisecond
+    bool measured; // a cpu timer ran since the last sync, which those timing the game's update do before the frame
     float result, print;
 };
 static vector<timer> timers;
@@ -890,6 +892,10 @@ timer *findtimer(const char *name, bool gpu)
         timerorder.add(i);
         return &timers[i];
     }
+    // timers that are running hold pointers into this, so it never moves: a new one started inside another would
+    // otherwise leave the outer one's pointer dangling, and a gpu one ended through it would stop all gpu timing
+    if(timers.empty()) timers.growbuf(256);
+    if(timers.length() >= 256) return NULL;
     timerorder.add(timers.length());
     timer &t = timers.add();
     t.name = name;
@@ -898,6 +904,8 @@ timer *findtimer(const char *name, bool gpu)
     if(gpu) glGenQueries_(timer::MAXQUERY, t.query);
     t.waiting = 0;
     t.starttime = 0;
+    t.startticks = 0;
+    t.measured = false;
     t.result = -1;
     t.print = -1;
     return &t;
@@ -905,15 +913,21 @@ timer *findtimer(const char *name, bool gpu)
 
 timer *begintimer(const char *name, bool gpu)
 {
-    if(!usetimers || inbetweenframes || (gpu && (!hasTQ || deferquery))) return NULL;
+    // only gpu timers need a frame being drawn, cpu ones also time the game's update between frames
+    if(!usetimers || (gpu && (inbetweenframes || !hasTQ || deferquery))) return NULL;
     timer *t = findtimer(name, gpu);
+    if(!t) return NULL;
     if(t->gpu)
     {
         deferquery++;
         glBeginQuery_(GL_TIME_ELAPSED_EXT, t->query[timercycle]);
         t->waiting |= 1<<timercycle;
     }
-    else t->starttime = getclockmillis();
+    else
+    {
+        t->starttime = getclockmillis();
+        t->startticks = SDL_GetPerformanceCounter();
+    }
     return t;
 }
 
@@ -925,7 +939,11 @@ void endtimer(timer *t)
         glEndQuery_(GL_TIME_ELAPSED_EXT);
         deferquery--;
     }
-    else t->result = max(float(getclockmillis() - t->starttime), 0.0f);
+    else
+    {
+        t->result = float(double(SDL_GetPerformanceCounter() - t->startticks) * 1000.0 / double(SDL_GetPerformanceFrequency()));
+        t->measured = true;
+    }
 }
 
 void synctimers()
@@ -945,7 +963,8 @@ void synctimers()
             t.result = max(float(result) * 1e-6f, 0.0f);
             t.waiting &= ~(1<<timercycle);
         }
-        else t.result = -1;
+        else if(t.gpu || !t.measured) t.result = -1;
+        if(!t.gpu) t.measured = false;
     }
 }
 
@@ -1037,6 +1056,9 @@ void gl_init()
 
     glEnable(GL_LINE_SMOOTH);
     //glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+
+    // envmap mips blur across cube faces for rough reflections
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
 
     glFrontFace(GL_CW);
     glCullFace(GL_BACK);
@@ -2454,10 +2476,16 @@ void gl_drawhud(bool noview = false)
 {
     timer *hudtimer = begintimer("HUD", false);
 
+    timer *auratimer = begintimer("Aura", false);
     if(!noview) aurasurf.render();
+    endtimer(auratimer);
 
+    timer *uitimer = begintimer("UI", false);
     UI::build(noview);
+    endtimer(uitimer);
+    timer *visortimer = begintimer("Visor", false);
     visorsurf.render();
+    endtimer(visortimer);
 
     debugparticles();
     debuglights();

@@ -435,7 +435,7 @@ namespace game
     FVAR(IDF_PERSIST, playertonedisplaylevel, 0.f, 1.f, 10.f);
     FVAR(IDF_PERSIST, playertonedisplaymix, 0, 0.75f, 1); // when colour and team are combined
 
-    VAR(IDF_PERSIST, playerauras, 0, 7, 7); // bitwise: 1 = self, 2 = self in first person, 4 = others
+    VAR(IDF_PERSIST, playerauras, 0, 0, 7); // bitwise: 1 = self, 2 = self in first person, 4 = others; none by default, as a glow around every player hides them as much as it shows them
     VAR(IDF_PERSIST, playerauradamage, 0, 3, 7); // bitwise: 1 = from self, 2 = to self, 4 = others
     VAR(IDF_PERSIST, playerauradamagetime, 0, 500, VAR_MAX);
     VAR(IDF_PERSIST, playerauratone, -1, CTONE_TEAM, CTONE_MAX-1);
@@ -2879,11 +2879,15 @@ namespace game
 
     void preload()
     {
+        loadstep(NULL);
         ai::preload();
         weapons::preload();
         projs::preload();
+        loadstep("preload weapons and projectiles");
         loopv(mixers) loopj(2) mixers[i].loadtex(j!=0);
+        loadstep("preload mixers");
         vanitypreload();
+        loadstep("preload vanities");
         if(m_edit(gamemode) || m_capture(gamemode)) capture::preload();
         if(m_edit(gamemode) || m_defend(gamemode)) defend::preload();
         if(m_edit(gamemode) || m_bomber(gamemode)) bomber::preload();
@@ -2896,8 +2900,10 @@ namespace game
             }
             preloadmodel(actors[i].mdl);
         }
+        loadstep("preload actors");
 
         flushpreloadedmodels();
+        loadstep("flushpreloadedmodels");
     }
 
     void resetmap(bool empty) // called just before a map load
@@ -2926,8 +2932,11 @@ namespace game
             else if(strcmp(mixers[n].id, player1->mixer)) setsvar("playermixer", mixers[n].id, true);
         }
 
+        loadstep(NULL);
         checklights(true);
+        loadstep("checklights");
         ai::startmap(empty);
+        loadstep("ai startmap");
         if(!empty)
         {
             gamestate = G_S_WAITING;
@@ -2939,7 +2948,9 @@ namespace game
         physics::reset();
         resetworld();
         resetcursor();
+        loadstep("resets");
         if(!empty) preload();
+        loadstep("preload");
         gameent *d;
         int numdyns = numdynents();
         loopi(numdyns) if((d = (gameent *)iterdynents(i)) && gameent::is(d)) d->mapchange(lastmillis, gamemode, mutators);
@@ -4246,11 +4257,21 @@ namespace game
             }
             else if(zooming) zoomset(false, 0);
 
+            timer *phystimer = begintimer("Physics", false);
             physics::update();
+            endtimer(phystimer);
+            timer *aitimer = begintimer("AI", false);
             ai::navigate();
+            endtimer(aitimer);
+            timer *projtimer = begintimer("Projectiles", false);
             projs::update();
+            endtimer(projtimer);
+            aitimer = begintimer("AI", false);
             ai::update();
+            endtimer(aitimer);
+            timer *enttimer = begintimer("Entities", false);
             entities::update();
+            endtimer(enttimer);
 
             if(gs_playing(gamestate))
             {

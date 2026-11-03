@@ -1406,6 +1406,17 @@ static Texture *newtexture(Texture *t, const char *rname, ImageData &s, int tcla
     t->used = t->last = getclockticks();
     t->rendered = 1;
     if(t->frames.length() > 1 && animtextures.find(t) < 0) animtextures.add(t);
+    // <texgen:w,h> lays the texture over the world as if it were w by h, so a finer replacement covers what it replaces
+    if(const char *texgen = strstr(t->name, "<texgen:"))
+    {
+        const char *end = strchr(texgen, '>'), *comma = strchr(texgen, ',');
+        int w = atoi(texgen + 8), h = comma && comma < end ? atoi(comma + 1) : 0;
+        if(w > 0 && t->xs > 0)
+        {
+            t->ys = h > 0 ? h : max(int(w * float(t->ys) / t->xs + 0.5f), 1);
+            t->xs = w;
+        }
+    }
     return t;
 }
 
@@ -1943,6 +1954,249 @@ Texture *textureloaded(const char *name)
     return textures.access(tname);
 }
 
+// what the driver compressed, kept in the home directory so the next time a texture loads it goes up as it was made,
+// without decoding its files or compressing it again, which is most of the time a map or the player models take to load;
+// an entry keeps the sizes and times of the files it was made from and the settings that shaped it, and the texture is
+// made again when any of them differ
+VAR(IDF_PERSIST, texcache, 0, 1, 1);
+
+enum { TEXCACHE_MAGIC = 0x31435852, TEXCACHE_VERSION = 1 }; // "RXC1"
+enum { TCH_MAGIC = 0, TCH_VERSION, TCH_KEYLEN, TCH_SOURCES, TCH_INITCLAMP, TCH_MIPIT, TCH_CANREDUCE,
+       TCH_TEXCOMPRESS, TCH_USETEXCOMPRESS, TCH_QUALITY, TCH_TEXREDUCE, TCH_MAXTEXSIZE, TCH_HWTEXSIZE, TCH_REDUCEFILTER, TCH_HASTSW,
+       TCH_TCLAMP, TCH_FORMAT, TCH_BPP, TCH_W, TCH_H, TCH_XS, TCH_YS, TCH_INTERNAL, TCH_LEVELS, TCH_MAX };
+
+static bool texcacheable(const char *key)
+{
+    return texcache && usetexcompress && key && *key && !strstr(key, "<comp") && !strstr(key, "<thumbnail") && !strstr(key, "<stub");
+}
+
+// the size and time of each file a texture key names, its parts joined by & and each after its commands
+static bool texcachesources(const char *key, vector<int64_t> &stamps)
+{
+    static const char * const exts[] = { "", ".png", ".tga", ".jpg", ".bmp" };
+    for(const char *part = key; *part;)
+    {
+        const char *end = strchr(part, '&');
+        size_t len = end ? size_t(end - part) : strlen(part);
+        string name;
+        copystring(name, part, min(len + 1, sizeof(name)));
+        const char *file = name;
+        bool dds = false;
+        while(*file == '<')
+        {
+            const char *close = strchr(file, '>');
+            if(!close) return false;
+            if(!strncmp(file, "<dds>", 5)) dds = usedds != 0;
+            file = close + 1;
+        }
+        if(!*file) return false;
+        if(dds)
+        {
+            // with usedds one made beforehand loads as it is, so only those without one come from the cache
+            string ddsfile;
+            copystring(ddsfile, file);
+            char *ext = strrchr(ddsfile, '.');
+            if(ext && !strchr(ext, '/')) *ext = '\0';
+            concatstring(ddsfile, ".dds");
+            struct stat st;
+            if(!stat(findfile(ddsfile, "rb"), &st)) return false;
+        }
+        bool found = false;
+        loopi(sizeof(exts)/sizeof(exts[0]))
+        {
+            defformatstring(buf, "%s%s", file, exts[i]);
+            struct stat st;
+            if(stat(findfile(buf, "rb"), &st) || !S_ISREG(st.st_mode)) continue;
+            stamps.add(int64_t(st.st_size));
+            stamps.add(int64_t(st.st_mtime));
+            found = true;
+            break;
+        }
+        if(!found) return false;
+        if(!end) break;
+        part = end + 1;
+    }
+    return !stamps.empty();
+}
+
+static void texcacheheader(int *hdr, const char *key, int numsources, int tclamp, bool mipit, bool canreduce)
+{
+    memset(hdr, 0, TCH_MAX*sizeof(int));
+    hdr[TCH_MAGIC] = TEXCACHE_MAGIC;
+    hdr[TCH_VERSION] = TEXCACHE_VERSION;
+    hdr[TCH_KEYLEN] = strlen(key);
+    hdr[TCH_SOURCES] = numsources;
+    hdr[TCH_INITCLAMP] = tclamp;
+    hdr[TCH_MIPIT] = mipit ? 1 : 0;
+    hdr[TCH_CANREDUCE] = canreduce ? 1 : 0;
+    hdr[TCH_TEXCOMPRESS] = texcompress;
+    hdr[TCH_USETEXCOMPRESS] = usetexcompress;
+    hdr[TCH_QUALITY] = texcompressquality;
+    hdr[TCH_TEXREDUCE] = canreduce ? texreduce : 0;
+    hdr[TCH_MAXTEXSIZE] = maxtexsize;
+    hdr[TCH_HWTEXSIZE] = hwtexsize;
+    hdr[TCH_REDUCEFILTER] = reducefilter;
+    hdr[TCH_HASTSW] = hasTSW ? 1 : 0;
+}
+
+static void texcachefile(string &file, const char *key, int tclamp, bool mipit, bool canreduce)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for(const char *c = key; *c; c++) hash = (hash ^ uchar(*c)) * 1099511628211ULL;
+    hash = (hash ^ uint(tclamp)) * 1099511628211ULL;
+    hash = (hash ^ (mipit ? 1 : 2) ^ (canreduce ? 4 : 8)) * 1099511628211ULL;
+    formatstring(file, "cache/textures/%016llx.rtc", (unsigned long long)hash);
+}
+
+static int texcachefilter(bool mipit, bool canreduce) { return !canreduce || reducefilter ? (mipit ? 2 : 1) : 0; }
+
+VAR(0, debugtexcache, 0, 0, 1);
+
+static void texcachesave(Texture *t, const char *key, int tclamp, bool mipit, bool canreduce)
+{
+    if(!t || t == notexture || !texcacheable(key) || t->frames.length() != 1 || t->type&(Texture::COMPRESSED|Texture::STUB))
+    {
+        if(debugtexcache && t && t != notexture) conoutf(colourgrey, "Texture cache skips %s", key);
+        return;
+    }
+    vector<int64_t> stamps;
+    if(!texcachesources(key, stamps))
+    {
+        if(debugtexcache) conoutf(colourgrey, "Texture cache finds no files for %s", key);
+        return;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, t->frames[0]);
+    GLint compressed = 0, internal = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_COMPRESSED, &compressed);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &internal);
+    if(!compressed) return;
+
+    int levels = texcachefilter(mipit, canreduce) > 1 ? miplevels(max(t->w, t->h)) : 1;
+    vector<int> sizes;
+    int total = 0;
+    loopi(levels)
+    {
+        GLint size = 0;
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, i, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
+        if(size <= 0) return;
+        sizes.add(size);
+        total += size;
+    }
+    uchar *data = new uchar[total], *dst = data;
+    loopi(levels)
+    {
+        glGetCompressedTexImage_(GL_TEXTURE_2D, i, dst);
+        dst += sizes[i];
+    }
+
+    int hdr[TCH_MAX];
+    texcacheheader(hdr, key, stamps.length()/2, tclamp, mipit, canreduce);
+    hdr[TCH_TCLAMP] = t->tclamp;
+    hdr[TCH_FORMAT] = t->format;
+    hdr[TCH_BPP] = t->bpp;
+    hdr[TCH_W] = t->w;
+    hdr[TCH_H] = t->h;
+    hdr[TCH_XS] = t->xs;
+    hdr[TCH_YS] = t->ys;
+    hdr[TCH_INTERNAL] = internal;
+    hdr[TCH_LEVELS] = levels;
+
+    string file;
+    texcachefile(file, key, tclamp, mipit, canreduce);
+    stream *f = openfile(file, "wb");
+    if(f)
+    {
+        bool ok = f->write(hdr, sizeof(hdr)) && f->write(key, hdr[TCH_KEYLEN]) &&
+                  f->write(stamps.getbuf(), stamps.length()*sizeof(int64_t)) && f->write(sizes.getbuf(), levels*sizeof(int)) && f->write(data, total);
+        delete f;
+        if(!ok) remove(findfile(file, "wb"));
+    }
+    delete[] data;
+}
+
+static Texture *texcacheload(const char *key, int tclamp, bool mipit, bool canreduce, bool transient, bool gc)
+{
+    if(!texcacheable(key)) return NULL;
+    vector<int64_t> stamps;
+    if(!texcachesources(key, stamps)) return NULL;
+    string file;
+    texcachefile(file, key, tclamp, mipit, canreduce);
+    stream *f = openfile(file, "rb");
+    if(!f) return NULL;
+
+    int hdr[TCH_MAX], want[TCH_MAX];
+    texcacheheader(want, key, stamps.length()/2, tclamp, mipit, canreduce);
+    Texture *t = NULL;
+    if(f->read(hdr, sizeof(hdr)) == sizeof(hdr) && !memcmp(hdr, want, TCH_TCLAMP*sizeof(int)) &&
+       hdr[TCH_LEVELS] > 0 && hdr[TCH_LEVELS] <= 16 && hdr[TCH_W] > 0 && hdr[TCH_H] > 0)
+    {
+        int levels = hdr[TCH_LEVELS], keylen = hdr[TCH_KEYLEN], sizes[16];
+        char *name = new char[keylen];
+        int64_t *oldstamps = new int64_t[stamps.length()];
+        size_t stampsize = stamps.length()*sizeof(int64_t);
+        if(f->read(name, keylen) == size_t(keylen) && !memcmp(name, key, keylen) &&
+           f->read(oldstamps, stampsize) == stampsize && !memcmp(oldstamps, stamps.getbuf(), stampsize) &&
+           f->read(sizes, levels*sizeof(int)) == levels*sizeof(int))
+        {
+            int total = 0;
+            loopi(levels) total += sizes[i];
+            uchar *data = total > 0 ? new uchar[total] : NULL;
+            if(data && f->read(data, total) == size_t(total))
+            {
+                char *tkey = newstring(key);
+                t = &textures[tkey];
+                t->name = tkey;
+                t->frames.shrink(0);
+                t->frame = 0;
+                t->tclamp = hdr[TCH_TCLAMP];
+                t->mipmap = mipit;
+                t->type = Texture::IMAGE;
+                if(gc) t->type |= Texture::GC;
+                if(transient) t->type |= Texture::TRANSIENT;
+                if(t->tclamp&0x300) t->type |= Texture::MIRROR;
+                t->format = hdr[TCH_FORMAT];
+                t->bpp = hdr[TCH_BPP];
+                if(alphaformat(t->format)) t->type |= Texture::ALPHA;
+                t->delay = 0;
+                t->throb = false;
+                t->w = hdr[TCH_W];
+                t->h = hdr[TCH_H];
+                t->xs = hdr[TCH_XS];
+                t->ys = hdr[TCH_YS];
+                t->frames.add(0);
+                glGenTextures(1, &t->frames[0]);
+
+                // as createtexture leaves it: storage for every level, then each level as the driver compressed it
+                int filter = texcachefilter(mipit, canreduce);
+                bool swizzle = !(t->tclamp&0x10000), prealloc = hasTS && hasTSW;
+                GLenum internal = hdr[TCH_INTERNAL];
+                setuptexparameters(t->frames[0], data, t->tclamp, filter, t->format, GL_TEXTURE_2D, swizzle);
+                if(prealloc) glTexStorage2D_(GL_TEXTURE_2D, levels, internal, t->w, t->h);
+                uchar *src = data;
+                for(int level = 0, w = t->w, h = t->h; level < levels; level++)
+                {
+                    int size = sizes[level];
+                    if(prealloc) glCompressedTexSubImage2D_(GL_TEXTURE_2D, level, 0, 0, w, h, internal, size, src);
+                    else glCompressedTexImage2D_(GL_TEXTURE_2D, level, internal, w, h, 0, size, src);
+                    src += size;
+                    if(w > 1) w /= 2;
+                    if(h > 1) h /= 2;
+                }
+                t->id = t->frames[0];
+                t->used = t->last = getclockticks();
+                t->rendered = 1;
+                // the sizes kept are those newtexture left, after any <texgen> in the name
+            }
+            if(data) delete[] data;
+        }
+        delete[] name;
+        delete[] oldstamps;
+    }
+    delete f;
+    return t;
+}
+
 Texture *textureload(const char *name, int tclamp, bool mipit, bool msg, bool gc)
 {
     if(name && !strncmp(name, "<comp", 5)) return UI::composite(name, tclamp, mipit, msg, gc);
@@ -1959,11 +2213,17 @@ Texture *textureload(const char *name, int tclamp, bool mipit, bool msg, bool gc
         return t;
     }
 
-    int compress = 0;
+    if((t = texcacheload(tname, tclamp, mipit, false, false, gc))) return t;
+
+    int compress = 0, initclamp = tclamp;
     ImageData s;
     TextureAnim anim;
     if(texturedata(s, tname, NULL, msg, &compress, &tclamp, &anim))
-        return newtexture(NULL, tname, s, tclamp, mipit, false, false, compress, &anim, gc);
+    {
+        t = newtexture(NULL, tname, s, tclamp, mipit, false, false, compress, &anim, gc);
+        texcachesave(t, tname, initclamp, mipit, false);
+        return t;
+    }
 
     return notexture;
 }
@@ -3274,7 +3534,8 @@ extern const namemap slottexs[] =
     {"z", TEX_DEPTH},
     {"a", TEX_ALPHA},
     {"e", TEX_ENVMAP},
-    {"v", TEX_DISPMAP}
+    {"v", TEX_DISPMAP},
+    {"m", TEX_PBR}
 };
 
 int findslottex(char *name, bool tryint)
@@ -3304,14 +3565,158 @@ void remtexture(char *type)
 }
 COMMAND(0, remtexture, "s");
 
+// replacements for the legacy textures: a map slot whose diffuse is a listed texture is defined by the listed script
+// instead, which gets none of the map's other textures for it, keeping only its placement and the commands after
+VAR(IDF_PERSIST, texreplacements, 0, 1, 1); // takes effect as maps load
+static hashtable<const char *, char *> texreplaces;
+static bool replacingslot = false, replacedslot = false;
+
+// maps name textures with and without their extensions
+static void texreplacekey(string &key, const char *name)
+{
+    copystring(key, name);
+    path(key);
+    char *ext = strrchr(key, '.');
+    if(ext && !strchr(ext, '/')) *ext = '\0';
+}
+
+ICOMMAND(0, texreplace, "ss", (char *name, char *script),
+{
+    string fixed;
+    texreplacekey(fixed, name);
+    char **cur = texreplaces.access(fixed);
+    if(cur) { DELETEA(*cur); *cur = newstring(script); }
+    else texreplaces[newstring(fixed)] = newstring(script);
+});
+
+static bool replaceslot(const char *name, int rot, int xoffset, int yoffset, float scale)
+{
+    if(!texreplacements || replacingslot) return false;
+    string fixed;
+    texreplacekey(fixed, name);
+    char **script = texreplaces.access(fixed);
+    if(!script) return false;
+
+    Shader *origshader;
+    vector<SlotShaderParam> origparams;
+    getslotshader(origshader, origparams);
+    int numslots = slots.length();
+    replacingslot = true;
+    execute(*script);
+    replacingslot = false;
+    restoreslotshader(origshader, origparams);
+    if(slots.length() != numslots + 1)
+    {
+        conoutf(colourred, "Texture replacement for %s must define one slot", fixed);
+        return false;
+    }
+
+    Slot &s = *slots.last();
+    s.origshader = origshader;
+    s.origparams = origparams;
+    Slot::Tex &t = s.origsts.add();
+    t.type = TEX_DIFFUSE;
+    copystring(t.name, name);
+    path(t.name);
+    if(rot || xoffset || yoffset || scale > 0)
+    {
+        VSlot &vs = *s.variants;
+        vs.rotation = clamp(rot, 0, 7);
+        vs.offset = ivec2(xoffset, yoffset).max(0);
+        vs.scale = scale <= 0 ? 1 : scale;
+        propagatevslot(&vs, VSLOTALL);
+    }
+    defslot = &s;
+    replacedslot = true;
+    return true;
+}
+
+// heights made from the slopes of the normal maps that have none (data/pbr/tools/normal_to_height.py): a slot using one
+// gets it as its depth and the parallax version of its shader as it loads, and saving the map keeps what it defined
+VAR(IDF_PERSIST, autoheights, 0, 1, 1); // takes effect as maps load
+FVAR(IDF_PERSIST, autoheightscale, 0, 1, 4); // how deep they go against what their normal maps show, as maps load
+struct autoheight { float depth, rest, aspect; };
+static hashtable<const char *, autoheight> autoheightmaps;
+
+// 1:normal map 2:height range, in widths of the texture 3:height most of it rests at 4:width over height
+ICOMMAND(0, texautoheight, "sfff", (char *name, float *depth, float *rest, float *aspect),
+{
+    string key;
+    texreplacekey(key, name);
+    autoheight *h = autoheightmaps.access(key);
+    if(!h) h = &autoheightmaps[newstring(key)];
+    h->depth = max(*depth, 0.0f);
+    h->rest = clamp(*rest, 0.0f, 1.0f);
+    h->aspect = *aspect > 0 ? *aspect : 1;
+});
+
+static void applyautoheight(Slot &s)
+{
+    if(!autoheights || autoheightscale <= 0 || s.type() != Slot::OCTA || !s.shader) return;
+    if((s.texmask&((1<<TEX_NORMAL)|(1<<TEX_DEPTH))) != (1<<TEX_NORMAL)) return;
+    const Slot::Tex *normal = NULL;
+    loopv(s.sts) if(s.sts[i].type == TEX_NORMAL) { normal = &s.sts[i]; break; }
+    if(!normal) return;
+    string key;
+    texreplacekey(key, normal->name);
+    autoheight *h = autoheightmaps.access(key);
+    if(!h || h->depth <= 0) return;
+
+    // bump[env][spec|specmap] comes before where the parallax versions put it, and those without one are left
+    const char *name = s.shader->name, *at = name;
+    if(strncmp(at, "bump", 4)) return;
+    at += 4;
+    if(!strncmp(at, "env", 3)) at += 3;
+    if(!strncmp(at, "specmap", 7)) at += 7;
+    else if(!strncmp(at, "spec", 4)) at += 4;
+    Shader *parallax = s.shader;
+    if(strncmp(at, "parallax", 8))
+    {
+        defformatstring(pname, "%.*sparallax%s", int(at - name), name, at);
+        parallax = findshaderbyname(pname);
+        if(!parallax) return;
+    }
+
+    if(s.origsts.empty())
+    {
+        s.origshader = s.shader;
+        s.origparams = s.params;
+        s.origsts = s.sts;
+    }
+    s.shader = parallax;
+    Slot::Tex &t = s.sts.add();
+    t.type = TEX_DEPTH;
+    formatstring(t.name, "pbr/height/%s.png", key);
+    s.texmask |= 1<<TEX_DEPTH;
+
+    // the most common height stays where the surface is, and the march counts across in widths of the texture
+    static const char *paramname = getshaderparamname("parallaxscale");
+    float depth = h->depth*autoheightscale;
+    SlotShaderParam *param = NULL;
+    loopv(s.params) if(s.params[i].name == paramname) { param = &s.params[i]; break; }
+    if(!param)
+    {
+        param = &s.params.add();
+        param->name = paramname;
+        param->flags = param->palette = param->palindex = 0;
+    }
+    param->loc = -1;
+    param->val[0] = depth;
+    param->val[1] = -h->rest*depth;
+    param->val[2] = h->aspect;
+    param->val[3] = 0;
+}
+
 void texture(char *type, char *name, int *rot, int *xoffset, int *yoffset, float *scale)
 {
     int tnum = findslottex(type), matslot = -1;
 
     if(!slotedit)
     {
+        if(tnum == TEX_DIFFUSE || !strcmp(type, "decal") || findmaterial(type) >= 0) replacedslot = false;
         if(tnum == TEX_DIFFUSE)
         {
+            if(replaceslot(name, *rot, *xoffset, *yoffset, *scale)) return;
             if(slots.length() >= 0x10000) return;
             defslot = slots.add(new Slot(slots.length()));
             defslot->group = curtexgroup && curtexgroup[0] ? newstring(curtexgroup) : NULL;
@@ -3343,6 +3748,14 @@ void texture(char *type, char *name, int *rot, int *xoffset, int *yoffset, float
     }
     else if(tnum < 0) tnum = TEX_UNKNOWN;
     if(materialcheck && matslot < 0) return;
+    if(replacedslot && !slotedit)
+    {
+        Slot::Tex &t = defslot->origsts.add();
+        t.type = tnum;
+        copystring(t.name, name);
+        path(t.name);
+        return;
+    }
     Slot &s = *defslot;
     s.loaded = false;
     s.texmask |= 1<<tnum;
@@ -4329,6 +4742,7 @@ void Slot::load(int index, Slot::Tex &t)
         if(t.t->type&Texture::GC) t.t->type &= ~Texture::GC;
         return;
     }
+    if((t.t = texcacheload(key.getbuf(), 0, true, true, true, false))) return;
     int compress = 0, tclamp = 0;
     ImageData ts;
     TextureAnim anim;
@@ -4360,10 +4774,12 @@ void Slot::load(int index, Slot::Tex &t)
     }
     if(!ts.compressed && shouldpremul(t.type)) texpremul(ts);
     t.t = newtexture(NULL, key.getbuf(), ts, tclamp, true, true, true, compress, &anim);
+    texcachesave(t.t, key.getbuf(), 0, true, true);
 }
 
 void Slot::load()
 {
+    applyautoheight(*this);
     linkslotshader(*this);
 
     loopv(sts)
@@ -4942,6 +5358,43 @@ ushort closestenvmap(const vec &o)
 GLuint closestenvmaptex(const vec &o)
 {
     return lookupenvmapindex(lookupenvmappos(o));
+}
+
+static inline int envmaplod(const envmap &em)
+{
+    return em.size ? min(em.size, envmapsize) : envmapsize;
+}
+
+int findreflectionprobes(const vec &o, int maxprobes, GLuint *texs, vec4 *posradius, float *lods, GLuint &skytex, float &skylod)
+{
+    skytex = lookupskyenvmap();
+    skylod = envmaps.length() ? envmaplod(envmaps[0]) : 0;
+    // the probes whose reach comes closest to the camera, nearest first
+    int indices[4], found = 0;
+    float dists[4];
+    maxprobes = min(maxprobes, 4);
+    const vector<extentity *> &ents = entities::getents();
+    loopv(envmaps)
+    {
+        envmap &em = envmaps[i];
+        if(em.radius < 0 || !em.tex || (ents.inrange(em.id) && !ents[em.id]->links.empty())) continue;
+        float radius = em.radius ? em.radius : envmapradius, dist = max(em.o.dist(o) - radius, 0.0f);
+        int pos = found;
+        while(pos > 0 && dists[pos-1] > dist) pos--;
+        if(pos >= maxprobes) continue;
+        for(int j = min(found, maxprobes-1); j > pos; j--) { indices[j] = indices[j-1]; dists[j] = dists[j-1]; }
+        indices[pos] = i;
+        dists[pos] = dist;
+        if(found < maxprobes) found++;
+    }
+    loopi(found)
+    {
+        envmap &em = envmaps[indices[i]];
+        texs[i] = em.tex;
+        posradius[i] = vec4(em.o, 1.0f/max(float(em.radius ? em.radius : envmapradius), 1.0f));
+        lods[i] = envmaplod(em);
+    }
+    return found;
 }
 
 GLuint closestenvmapbb(const vec &center, const ivec &bbmin, const ivec &bbmax)

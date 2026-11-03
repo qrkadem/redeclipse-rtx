@@ -14,6 +14,10 @@ extern char *servermaster, *serverip;
 extern ENetAddress masteraddress;
 extern void fatal(const char *s, ...) PRINTFARGS(1, 2);
 extern void conoutf(int color, const char *s, ...) PRINTFARGS(2, 3);
+struct timer;
+extern timer *begintimer(const char *name, bool gpu);
+extern void endtimer(timer *t);
+extern void loadstep(const char *name); // development aid: with loadtimes 1, prints how long the step of a map load since the last call took
 extern void eventf(int color, const char *s, ...) PRINTFARGS(2, 3);
 
 extern FILE *logfile;

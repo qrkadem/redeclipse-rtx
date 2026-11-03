@@ -1959,6 +1959,22 @@ namespace client
     }
     ICOMMAND(IDF_NAMECOMPLETE, goto, "s", (char *s), gotoplayer(s));
 
+    void gotopos(const vec &o, float yaw, float pitch)
+    {
+        if(game::player1->state != CS_SPECTATOR && game::player1->state != CS_EDITING) return;
+        game::player1->o = o;
+        game::player1->yaw = yaw;
+        game::player1->pitch = pitch;
+        game::player1->resetinterp(true);
+        game::resetcamera();
+    }
+    ICOMMAND(0, gotopos, "fffff", (float *x, float *y, float *z, float *yaw, float *pitch), gotopos(vec(*x, *y, *z), *yaw, *pitch));
+    ICOMMAND(0, getpos, "", (),
+    {
+        defformatstring(pos, "%.1f %.1f %.1f %.1f %.1f", game::player1->o.x, game::player1->o.y, game::player1->o.z, game::player1->yaw, game::player1->pitch);
+        result(pos);
+    });
+
     void editvar(ident *id, bool local)
     {
         if(id && id->flags&IDF_MAP && !(id->flags&IDF_META) && !(id->flags&IDF_SERVER) && local && m_edit(game::gamemode) && game::player1->state == CS_EDITING)

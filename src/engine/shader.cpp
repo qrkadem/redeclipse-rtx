@@ -58,6 +58,9 @@ Shader *lookupshaderbyname(const char *name)
 }
 ICOMMAND(IDF_SAFE, hasshader, "s", (char *name), intret(lookupshaderbyname(name) ? 1 : 0));
 
+// a shader by name whether or not it has been made yet, as a slot can take one that is made as it loads
+Shader *findshaderbyname(const char *name) { return shaders.access(name); }
+
 Shader *generateshader(const char *name, const char *fmt, ...)
 {
     if(!loadedshaders) return NULL;
@@ -299,6 +302,7 @@ static void bindtexlocs(Shader &s)
         UNIFORMTEX("normaldetail", TEX_DETAIL_NORMAL);
         UNIFORMTEX("dispdetail", TEX_DETAIL_DISPMAP);
         UNIFORMTEX("blendmap", TEX_BLENDMAP);
+        UNIFORMTEX("pbrmap", TEX_PBR_UNIT);
     }
 
     UNIFORMTEX("earlydepth", TEX_EARLY_DEPTH);
@@ -1135,6 +1139,19 @@ void setshader(char *name)
     else slotshader = s;
 }
 COMMAND(IDF_SAFE, setshader, "s");
+
+// lets a texture replacement set the shader of its slot without changing what the slots after it get
+void getslotshader(Shader *&s, vector<SlotShaderParam> &params)
+{
+    s = slotshader;
+    params = slotparams;
+}
+
+void restoreslotshader(Shader *s, const vector<SlotShaderParam> &params)
+{
+    slotshader = s;
+    slotparams = params;
+}
 
 void resetslotshader()
 {

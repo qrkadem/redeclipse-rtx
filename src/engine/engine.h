@@ -262,6 +262,7 @@ extern int closestenvmapindex(const vec &center, const ivec &bbmin, const ivec &
 extern GLuint lookupenvmap(ushort emid);
 extern GLuint lookupenvmap(Slot &slot);
 extern GLuint entityenvmap(int id);
+extern int findreflectionprobes(const vec &o, int maxprobes, GLuint *texs, vec4 *posradius, float *lods, GLuint &skytex, float &skylod);
 extern void initenvtexs();
 extern void genenvtexs();
 extern bool reloadtexture(Texture *t);

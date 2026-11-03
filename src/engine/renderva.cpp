@@ -1861,6 +1861,9 @@ static void changeslottmus(renderstate &cur, int pass, Slot &slot, VSlot &vslot)
             case TEX_DISPMAP:
                 bindslottex(cur, t.type, t.t);
                 break;
+            case TEX_PBR:
+                bindslottex(cur, TEX_PBR_UNIT, t.t);
+                break;
         }
     }
 

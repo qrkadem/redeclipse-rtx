@@ -2127,6 +2127,14 @@ namespace entities
     }
     ICOMMAND(0, entspawned, "i", (int *n), intret(ents.inrange(*n) && ents[*n]->spawned() ? 1 : 0));
 
+    // the first of each type starts past every entity so the lowest index it is given is kept, where starting at 0
+    // left every type's loops starting from the first entity on the map
+    static void resettyperanges()
+    {
+        loopi(MAXENTTYPES) { firstenttype[i] = INT_MAX; lastenttype[i] = 0; }
+        loopi(EU_MAX) { firstusetype[i] = INT_MAX; lastusetype[i] = 0; }
+    }
+
     extentity *newent() { return new gameentity; }
     void deleteent(extentity *e) { delete (gameentity *)e; }
 
@@ -2134,10 +2142,7 @@ namespace entities
     {
         entindex = -1;
         while(ents.length()) deleteent(ents.pop());
-        memset(firstenttype, 0, sizeof(firstenttype));
-        memset(firstusetype, 0, sizeof(firstusetype));
-        memset(lastenttype, 0, sizeof(lastenttype));
-        memset(lastusetype, 0, sizeof(lastusetype));
+        resettyperanges();
     }
 
     bool cansee(int n)
@@ -3072,10 +3077,7 @@ namespace entities
             progress((i+1)/float(ents.length()), "Setting entity attributes..");
         }
 
-        memset(firstenttype, 0, sizeof(firstenttype));
-        memset(firstusetype, 0, sizeof(firstusetype));
-        memset(lastenttype, 0, sizeof(lastenttype));
-        memset(lastusetype, 0, sizeof(lastusetype));
+        resettyperanges();
 
         if(m_onslaught(game::gamemode, game::mutators) && !numactors)
         {

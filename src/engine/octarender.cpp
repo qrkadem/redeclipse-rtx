@@ -1843,10 +1843,120 @@ void precachetextures()
     loadprogress = 0;
 }
 
+// lists the texture slots covering the most world surface, to find which materials matter most in a map
+void texusage(int num)
+{
+    vector<float> area;
+    loopv(valist)
+    {
+        vtxarray *va = valist[i];
+        const ushort *idx = va->edata + va->eoffset;
+        loopj(va->texs + va->blends + va->alphaback + va->alphafront + va->refract)
+        {
+            const elementset &e = va->texelems[j];
+            VSlot &vslot = lookupvslot(e.texture, false);
+            int slot = vslot.slot ? vslot.slot->index : 0;
+            while(area.length() <= slot) area.add(0);
+            for(int k = 0; k + 2 < e.length; k += 3)
+            {
+                const vec &a = va->vdata[idx[k]].pos, &b = va->vdata[idx[k+1]].pos, &c = va->vdata[idx[k+2]].pos;
+                area[slot] += vec().cross(vec(b).sub(a), vec(c).sub(a)).magnitude()*0.5f;
+            }
+            idx += e.length;
+        }
+    }
+    vector<int> order;
+    loopv(area) if(area[i] > 0) order.add(i);
+    order.sort([&area](int a, int b) { return area[a] > area[b]; });
+    float total = 0;
+    loopv(order) total += area[order[i]];
+    loopv(order)
+    {
+        if(num > 0 && i >= num) break;
+        Slot &s = *slots[order[i]];
+        conoutf(colourwhite, "%d: %.1f%% %s [%s]", order[i], 100*area[order[i]]/max(total, 1.0f), s.sts.empty() ? "" : s.sts[0].name, s.shader ? s.shader->name : "");
+    }
+}
+ICOMMAND(0, texusage, "i", (int *n), texusage(*n));
+
+// a view of the nth largest triangle of the slots whose diffuse, or the one a replacement took the place of, contains name:
+// "x y z yaw pitch" from dist away and angle degrees off the surface
+void texview(const char *name, float dist, float angle, int nth)
+{
+    vector<bool> match;
+    loopv(slots)
+    {
+        Slot &s = *slots[i];
+        const char *diffuse = !s.origsts.empty() ? s.origsts[0].name : (!s.sts.empty() ? s.sts[0].name : "");
+        match.add(*name && strstr(diffuse, name));
+    }
+    struct tri { float area; vec center, normal; };
+    vector<tri> tris;
+    loopv(valist)
+    {
+        vtxarray *va = valist[i];
+        const ushort *idx = va->edata + va->eoffset;
+        loopj(va->texs + va->blends + va->alphaback + va->alphafront + va->refract)
+        {
+            const elementset &e = va->texelems[j];
+            VSlot &vslot = lookupvslot(e.texture, false);
+            if(vslot.slot && match.inrange(vslot.slot->index) && match[vslot.slot->index])
+                for(int k = 0; k + 2 < e.length; k += 3)
+                {
+                    const vec &a = va->vdata[idx[k]].pos, &b = va->vdata[idx[k+1]].pos, &c = va->vdata[idx[k+2]].pos;
+                    vec n = vec().cross(vec(b).sub(a), vec(c).sub(a));
+                    tri &t = tris.add();
+                    t.area = n.magnitude()*0.5f;
+                    t.normal = n.normalize();
+                    t.center = vec(a).add(b).add(c).div(3);
+                }
+            idx += e.length;
+        }
+    }
+    tris.sort([](const tri &a, const tri &b) { return a.area > b.area; });
+    if(!tris.inrange(nth)) { result(""); return; }
+    const tri &t = tris[nth];
+    // floors are seen from along x, walls from beside and a little above
+    vec side = fabs(t.normal.z) > 0.7f ? vec(1, 0, 0) : vec(0, 0, 1);
+    side.sub(vec(t.normal).mul(side.dot(t.normal))).normalize();
+    vec offset = vec(t.normal).mul(sinf(angle*RAD)).add(vec(side).mul(cosf(angle*RAD)));
+    vec pos = vec(t.center).add(vec(offset).mul(dist));
+    float yaw, pitch;
+    vectoyawpitch(vec(offset).neg(), yaw, pitch);
+    defformatstring(view, "%f %f %f %f %f", pos.x, pos.y, pos.z, yaw, pitch);
+    result(view);
+}
+ICOMMAND(0, texview, "sffi", (char *name, float *dist, float *angle, int *nth), texview(name, *dist, *angle, *nth));
+
+// development aid: "x y z yaw" of the nth entity of a type, for putting the camera where players start
+ICOMMAND(0, entview, "ii", (int *type, int *nth),
+{
+    const vector<extentity *> &ents = entities::getents();
+    int count = 0;
+    loopv(ents) if(ents[i]->type == *type && count++ == *nth)
+    {
+        defformatstring(pos, "%.1f %.1f %.1f %d", ents[i]->o.x, ents[i]->o.y, ents[i]->o.z, ents[i]->attrs.inrange(1) ? ents[i]->attrs[1] : 0);
+        result(pos);
+        return;
+    }
+    result("");
+});
+
+// development aid: prints how long each step of loading a map takes
+VAR(0, loadtimes, 0, 0, 1);
+static Uint64 loadstepticks = 0;
+void loadstep(const char *name)
+{
+    Uint64 now = SDL_GetPerformanceCounter();
+    if(loadtimes && name && loadstepticks) conoutf(colourgrey, "Load step %s: %.0fms", name, double(now - loadstepticks) * 1000.0 / double(SDL_GetPerformanceFrequency()));
+    loadstepticks = now;
+}
+
 void allchanged(bool load)
 {
     if(!connected()) load = false;
     progress(-20, "Recalculating world..");
+    loadstep(NULL);
     PROGRESS(0); if(load) initlights();
     PROGRESS(1); clearvas(worldroot);
     PROGRESS(2); resetqueries();
@@ -1855,19 +1965,27 @@ void allchanged(bool load)
     PROGRESS(5); entitiesinoctanodes();
     PROGRESS(6); tjoints.setsize(0);
     PROGRESS(7); if(filltjoints) findtjoints();
+    loadstep("start");
     PROGRESS(8); octarender();
+    loadstep("octarender");
     PROGRESS(9); if(load) precachetextures();
+    loadstep("precachetextures");
     PROGRESS(10); hazesurf.create();
     PROGRESS(11); setupmaterials();
     PROGRESS(12); updatevabbs(true);
     PROGRESS(13); entities::allchanged(load);
+    loadstep("materials and entities");
     if(load)
     {
         PROGRESS(14); genshadowmeshes();
+        loadstep("genshadowmeshes");
         PROGRESS(15); updateblendtextures();
         PROGRESS(16); seedparticles();
+        loadstep("blend and particles");
         PROGRESS(17); genenvtexs();
+        loadstep("genenvtexs");
         PROGRESS(18); drawminimap();
+        loadstep("drawminimap");
     }
     PROGRESS(19); clearshadowcache();
     PROGRESS(20);

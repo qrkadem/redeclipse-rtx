@@ -477,6 +477,7 @@ struct skelmodel : animmodel
 
         ~skeleton()
         {
+            cleartagcache();
             DELETEA(name);
             DELETEA(bones);
             DELETEA(framebones);
@@ -529,10 +530,23 @@ struct skelmodel : animmodel
             return num;
         }
 
+        // names already looked up, as attaching each weapon and vanity matches its tag's name against every tag of the
+        // skeleton each time a player is drawn
+        hashtable<const char *, int> tagcache;
+
+        void cleartagcache()
+        {
+            enumeratekt(tagcache, const char *, key, int, idx, { (void)idx; delete[] key; });
+            tagcache.clear();
+        }
+
         int findtag(const char *name)
         {
-            loopv(tags) if(cubematchstr(tags[i].name, name)) return i;
-            return -1;
+            if(const int *cached = tagcache.access(name)) return *cached;
+            int idx = -1;
+            loopv(tags) if(cubematchstr(tags[i].name, name)) { idx = i; break; }
+            tagcache[newstring(name)] = idx;
+            return idx;
         }
 
         int findtags(const char *name, vector<int> &elems)
@@ -558,6 +572,7 @@ struct skelmodel : animmodel
             }
             else
             {
+                cleartagcache();
                 tag &t = tags.add();
                 t.name = newstring(name);
                 t.bone = bone;

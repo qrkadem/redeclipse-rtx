@@ -447,10 +447,17 @@ int modelanimlength(const char *name, int anim, dynent *d, int basetime)
 
 void flushpreloadedmodels(bool msg)
 {
+    extern int loadtimes;
     loopv(preloadmodels)
     {
         loadprogress = float(i+1)/preloadmodels.length();
+        Uint64 start = loadtimes ? SDL_GetPerformanceCounter() : 0;
         model *m = loadmodel(preloadmodels[i], -1, msg);
+        if(loadtimes)
+        {
+            double ms = double(SDL_GetPerformanceCounter() - start) * 1000.0 / double(SDL_GetPerformanceFrequency());
+            if(ms >= 100) conoutf(colourgrey, "Load step model %s: %.0fms", preloadmodels[i], ms);
+        }
         if(!m) { if(msg && !preloadquiet[i]) conoutf(colourred, "Could not load model: %s", preloadmodels[i]); }
         else
         {

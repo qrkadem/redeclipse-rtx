@@ -679,8 +679,11 @@ extern hashnameset<Texture> textures;
     en(um, Diffuse, DIFFUSE) en(um, Normalp, NORMAL) en(um, Glow, GLOW) en(um, Environment, ENVMAP) \
     en(um, Specular, SPEC) en(um, Depth, DEPTH) en(um, Alpha, ALPHA) en(um, Displacement, DISPMAP) \
     en(um, Detail Diffuse, DETAIL_DIFFUSE) en(um, Detail Normal, DETAIL_NORMAL) en(um, Detail Displacement, DETAIL_DISPMAP) \
-    en(um, Unknown, UNKNOWN) en(um, Maximum, MAX)
+    en(um, Unknown, UNKNOWN) en(um, PBR, PBR) en(um, Maximum, MAX)
 ENUM_DLN(TEX);
+// the PBR map (ambient occlusion, roughness, metalness in r, g, b) comes after the types whose values name the shader units, so it
+// uses the spec map's, which world slots never bind as spec maps are merged into the diffuse alpha
+ENUM_VAR(TEX_PBR_UNIT, TEX_SPEC);
 
 ENUM_VAR(TEX_BLENDMAP, TEX_UNKNOWN);
 ENUM_VAR(TEX_EARLY_DEPTH, TEX_UNKNOWN + 1);
@@ -956,6 +959,10 @@ struct Slot
     uint texmask;
     Texture *thumbnail;
     char *tags, *group;
+    // what the map defined, for a slot a texture replacement defined instead, so saving the map keeps its own
+    Shader *origshader;
+    vector<SlotShaderParam> origparams;
+    vector<Tex> origsts;
 
     Slot(int index = -1) : index(index), variants(NULL), tags(NULL), group(NULL) { reset(); }
     virtual ~Slot() {}
@@ -985,6 +992,9 @@ struct Slot
         texmask = 0;
         thumbnail = NULL;
         DELETEA(tags);
+        origshader = NULL;
+        origparams.setsize(0);
+        origsts.setsize(0);
     }
 
     void cleanup()
@@ -1098,12 +1108,15 @@ extern Shader *nullshader, *hudshader, *hudrectshader, *hudoutlineshader, *hudte
 extern int maxvsuniforms, maxfsuniforms;
 
 extern Shader *lookupshaderbyname(const char *name);
+extern Shader *findshaderbyname(const char *name);
 extern Shader *useshaderbyname(const char *name);
 extern Shader *generateshader(const char *name, const char *cmd, ...);
 extern float *findslotparam(Slot &s, const char *name, float &pal, float &palidx, float *noval = NULL);
 extern float *findslotparam(VSlot &s, const char *name, float &pal, float &palidx, float *noval = NULL);
 extern void resetslotshader();
 extern void setslotshader(Slot &s);
+extern void getslotshader(Shader *&s, vector<SlotShaderParam> &params);
+extern void restoreslotshader(Shader *s, const vector<SlotShaderParam> &params);
 extern void linkslotshader(Slot &s, bool load = true);
 extern void linkvslotshader(VSlot &s, bool load = true);
 extern void linkslotshaders();

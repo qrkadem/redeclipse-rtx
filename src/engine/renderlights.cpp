@@ -918,8 +918,19 @@ void setupgbuffer()
     setupscale(gw, gh, hudw, hudh);
 }
 
+static GLuint reflfbo = 0, refltex = 0;
+static int reflw = -1, reflh = -1;
+
+void cleanupreflections()
+{
+    if(reflfbo) { glDeleteFramebuffers_(1, &reflfbo); reflfbo = 0; }
+    if(refltex) { glDeleteTextures(1, &refltex); refltex = 0; }
+    reflw = reflh = -1;
+}
+
 void cleanupgbuffer()
 {
+    cleanupreflections();
     if(gfbo) { glDeleteFramebuffers_(1, &gfbo); gfbo = 0; }
     if(gdepthtex) { glDeleteTextures(1, &gdepthtex); gdepthtex = 0; }
     if(gcolortex) { glDeleteTextures(1, &gcolortex); gcolortex = 0; }
@@ -2756,6 +2767,13 @@ void cleardeferredlightshaders()
 
 extern int nospeclights, smalphalights;
 
+// lights use GGX microfacet specular, and the g-buffer holds roughness and metalness, which surfaces without PBR maps take
+// from their spec and gloss
+VARF(IDF_PERSIST, pbrlighting, 0, 1, 1, initwarning("PBR lighting", INIT_LOAD, CHANGE_SHADERS));
+FVAR(IDF_PERSIST, pbrf0, 0, 0.04f, 1); // reflectance at normal incidence of anything not metal
+FVARF(IDF_PERSIST, pbrroughmax, 0, 0.85f, 1, initwarning("PBR lighting", INIT_LOAD, CHANGE_SHADERS)); // roughness of a surface with no spec
+FVARF(IDF_PERSIST, pbrroughmin, 0, 0.35f, 1, initwarning("PBR lighting", INIT_LOAD, CHANGE_SHADERS)); // roughness of a full spec surface of the default gloss, each gloss level away moves it by 0.15
+
 Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
 {
     string common, shadow, sun;
@@ -2785,6 +2803,7 @@ Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
     else common[commonlen++] = 'N';
     if(wantspotlights()) common[commonlen++] = 's';
     if(nospeclights) common[commonlen++] = 'z';
+    if(pbrlighting && !minimap) common[commonlen++] = 'k';
     common[commonlen] = '\0';
 
     shadow[shadowlen++] = 'p';
@@ -5029,20 +5048,26 @@ void rendershadowatlas()
 
 void workinoq()
 {
+    timer *lighttimer = drawtex ? NULL : begintimer("Collect Lights", false);
     collectlights();
+    endtimer(lighttimer);
 
     if(!(DRAWTEX_GAME&(1<<drawtex)) && !isoqstate()) return;
 
+    timer *gametimer = drawtex ? NULL : begintimer("Game Models", false);
     rendertransparentmapmodels();
     game::render();
+    endtimer(gametimer);
 
     if(shouldworkinoq())
     {
         inoq = true;
 
+        timer *oqtimer = drawtex ? NULL : begintimer("Shadows in OQ", false);
         if(csminoq && !debugshadowatlas) rendercsmshadowmaps();
         if(sminoq && !debugshadowatlas) rendershadowmaps();
         if(rhinoq) renderradiancehints();
+        endtimer(oqtimer);
 
         inoq = false;
     }
@@ -5275,6 +5300,11 @@ void rendertransparent()
 VAR(0, gdepthclear, 0, 1, 1);
 VAR(0, gcolorclear, 0, 1, 1);
 
+VAR(IDF_PERSIST, parallaxsteps, 0, 32, 128); // most layers a parallax texture's height is marched in, steepest views use all of them, 0 is the old single offset
+VAR(IDF_PERSIST, parallaxminsteps, 1, 8, 128); // fewest layers marched, for surfaces seen head on
+FVAR(IDF_PERSIST, parallaxgrazing, 0.05f, 0.2f, 1); // least view facing the march is stretched over, keeps grazing views from smearing
+FVAR(IDF_PERSIST, parallaxdepth, 0, 2, 8); // scales how deep marched parallax textures go, which the old single offset could not take beyond their own scale
+
 void setupscreenparams()
 {
     matrix4 invscreenmatrix;
@@ -5321,6 +5351,8 @@ void setupscreenparams()
     GLOBALPARAMF(hdrgamma, hdrgamma, 1.0f/hdrgamma);
     GLOBALPARAM(camera, camera1->o);
     GLOBALPARAMF(millis, lastmillis/1000.0f);
+    GLOBALPARAMF(parallaxparams, min(parallaxminsteps, parallaxsteps), parallaxsteps, parallaxgrazing, parallaxdepth);
+    GLOBALPARAMF(pbrparams, pbrf0);
 }
 
 void preparegbuffer(bool depthclear, bool resetbatches)
@@ -5369,12 +5401,16 @@ void rendergbuffer(bool depthclear)
         renderexplicitsky();
         GLERROR;
     }
+    timer *geomtimer = drawtex ? NULL : begintimer("G-Buffer world", false);
     rendergeom();
     GLERROR;
     renderdecals();
     GLERROR;
+    endtimer(geomtimer);
+    timer *mmtimer = drawtex ? NULL : begintimer("G-Buffer map models", false);
     rendermapmodels();
     GLERROR;
+    endtimer(mmtimer);
 
     if(drawtex == DRAWTEX_MINIMAP)
     {
@@ -5384,8 +5420,10 @@ void rendergbuffer(bool depthclear)
     }
     else
     {
+        timer *mdltimer = drawtex ? NULL : begintimer("G-Buffer models", false);
         rendermodelbatches();
         GLERROR;
+        endtimer(mdltimer);
         if(!drawtex)
         {
             renderstains(STAINBUF_OPAQUE, true);
@@ -5495,6 +5533,112 @@ void shadesky()
     drawskybox((hdrclear > 0 ? hdrclear-- : msaalight) > 0);
 }
 
+VARF(IDF_PERSIST, reflections, 0, 1, 1, cleanupreflections()); // surfaces reflect their surroundings, by their roughness and metalness
+FVAR(IDF_PERSIST, reflscale, 0, 1, 4); // strength of reflections
+VAR(IDF_PERSIST, reflprobes, 0, 4, 4); // most environment maps blended into reflections, those reaching closest to the camera
+FVAR(IDF_PERSIST, reflsky, 0, 1, 4); // strength of the sky envmap reflected where no environment map reaches
+FVAR(IDF_PERSIST, reflambient, 0, 1, 4); // how much of the ambient light metal reflects, as though it came evenly from all around
+VAR(IDF_PERSIST, reflssr, 0, 1, 1); // reflections find the lit scene by marching through the depth buffer
+VAR(IDF_PERSIST, reflssrsteps, 1, 64, 256); // most steps a screen space reflection marches, each at least a pixel
+FVAR(IDF_PERSIST, reflssrdist, 16, 2048, 16384); // farthest a screen space reflection looks
+FVAR(IDF_PERSIST, reflssrthickness, 0, 8, 1024); // how far behind the depth buffer a march still counts as hitting it
+FVAR(IDF_PERSIST, reflssrrough, 0, 0.6f, 1); // roughness at which screen space reflections are gone, fading in from half of it
+
+// envmaps are drawn at an ldrscale of 1, where the view uses its own
+static const float envmapldrscale = 1.0f;
+
+void renderreflections()
+{
+    if(!reflections || drawtex || msaasamples || (editmode && fullbright)) return;
+
+    timer *refltimer = begintimer("Reflections");
+
+    if(reflssr)
+    {
+        // the march reads a copy of the lit scene, since it adds to the scene itself
+        if(!refltex || reflw != gw || reflh != gh)
+        {
+            cleanupreflections();
+            glGenTextures(1, &refltex);
+            glGenFramebuffers_(1, &reflfbo);
+            createtexture(refltex, gw, gh, NULL, 3, 0, hdrformat, GL_TEXTURE_RECTANGLE);
+            glBindFramebuffer_(GL_FRAMEBUFFER, reflfbo);
+            glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, refltex, 0);
+            if(glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                fatal("Failed allocating reflection buffer!");
+            reflw = gw;
+            reflh = gh;
+        }
+        glBindFramebuffer_(GL_READ_FRAMEBUFFER, hdrfbo);
+        glBindFramebuffer_(GL_DRAW_FRAMEBUFFER, reflfbo);
+        glBlitFramebuffer_(0, 0, vieww, viewh, 0, 0, vieww, viewh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    GLuint probetexs[4], skytex = 0;
+    vec4 probepos[4];
+    float probelods[4], skylod = 0;
+    int numprobes = findreflectionprobes(camera1->o, reflprobes, probetexs, probepos, probelods, skytex, skylod);
+    loopi(4) if(i >= numprobes)
+    {
+        // unused probes sample the sky at no weight
+        probetexs[i] = skytex;
+        probepos[i] = vec4(0, 0, 0, 1e9f);
+        probelods[i] = 0;
+    }
+
+    glBindFramebuffer_(GL_FRAMEBUFFER, hdrfbo);
+    glViewport(0, 0, vieww, viewh);
+
+    glBindTexture(GL_TEXTURE_RECTANGLE, gcolortex);
+    glActiveTexture_(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_RECTANGLE, gnormaltex);
+    if(reflssr)
+    {
+        glActiveTexture_(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_RECTANGLE, refltex);
+    }
+    glActiveTexture_(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
+    if(ao)
+    {
+        glActiveTexture_(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_RECTANGLE, aotex[2] ? aotex[2] : aotex[0]);
+    }
+    if(reflprobes) loopi(4)
+    {
+        glActiveTexture_(GL_TEXTURE6 + i);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, probetexs[i]);
+    }
+    glActiveTexture_(GL_TEXTURE10);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, skytex);
+    glActiveTexture_(GL_TEXTURE0);
+
+    GLOBALPARAMF(reflparams, reflscale, skylod, skytex ? reflsky : 0.0f, ldrscale/envmapldrscale);
+    GLOBALPARAMF(reflambient, reflambient);
+    GLOBALPARAMF(reflssrparams, reflssrsteps, reflssrdist, reflssrthickness, reflssrrough);
+    GLOBALPARAM(reflscreenmatrix, screenmatrix);
+    GLOBALPARAMF(reflprobelod, probelods[0], probelods[1], probelods[2], probelods[3]);
+    static GlobalShaderParam reflprobeposparam("reflprobepos");
+    reflprobeposparam.setv(probepos, 4);
+
+    string opts;
+    int optslen = 0;
+    if(ao) opts[optslen++] = 'a';
+    if(reflssr) opts[optslen++] = 's';
+    if(reflprobes) opts[optslen++] = 'p';
+    opts[optslen] = '\0';
+    defformatstring(name, "reflection%s", opts);
+    Shader *s = generateshader(name, "reflectionshader \"%s\"", opts);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    s->set();
+    screenquad();
+    glDisable(GL_BLEND);
+
+    endtimer(refltimer);
+}
+
 void shadegbuffer()
 {
     if(msaasamples && !msaalight && !drawtex) resolvemsaadepth();
@@ -5511,6 +5655,9 @@ void shadegbuffer()
         else renderlights(-1, -1, 1, 1, NULL, 0, drawtex ? -1 : 3);
     }
     else renderlights();
+    GLERROR;
+
+    renderreflections();
     GLERROR;
 
     if(!drawtex)
