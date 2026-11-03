@@ -663,11 +663,13 @@ namespace vk
         uint32_t index = UINT32_MAX;
         if(swapchain)
         {
-            VkResult r = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, p.acquired, VK_NULL_HANDLE, &index);
+            // a hidden window (another workspace) can hold its images forever with vsync on, then frames are dropped
+            const uint64_t timeout = 100000000;
+            VkResult r = vkAcquireNextImageKHR(device, swapchain, timeout, p.acquired, VK_NULL_HANDLE, &index);
             if(r == VK_ERROR_OUT_OF_DATE_KHR)
             {
                 index = UINT32_MAX;
-                if(createswapchain() && swapchain) r = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, p.acquired, VK_NULL_HANDLE, &index);
+                if(createswapchain() && swapchain) r = vkAcquireNextImageKHR(device, swapchain, timeout, p.acquired, VK_NULL_HANDLE, &index);
             }
             if(r == VK_SUBOPTIMAL_KHR) SDL_AtomicSet(&swapdirty, 1);
             else if(r != VK_SUCCESS) index = UINT32_MAX;
@@ -1289,6 +1291,7 @@ void vk_cleanupgl()
 {
     if(!device) return;
     vkrt_cleanupgl();
+    vk_dlsscleanupgl();
     destroyframes();
     if(glBindFramebufferreal && glBindFramebuffer_ == bindframebuffer) glBindFramebuffer_ = glBindFramebufferreal;
 }
@@ -1300,6 +1303,7 @@ void vk_shutdown()
         stoppresent();
         vkDeviceWaitIdle(device);
         vkrt_shutdown();
+        vk_dlssshutdown();
         ngx_shutdown();
         destroyswapchain();
         if(cmdpool) vkDestroyCommandPool(device, cmdpool, NULL);
@@ -1409,6 +1413,60 @@ void vk_snapshotview()
     viewfresh = true;
 }
 
+// motion to where each pixel was the frame before, in pixels, and depth as the depth buffer holds it, from the main
+// view's G-buffer into fbo's two attachments; screenm and prevscreen take world positions to this and last frame's pixels
+bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, const matrix4 &prevscreen)
+{
+    // lazy shaders only exist once something asks for them by name
+    Shader *vectorshader = useshaderbyname("dlssgvectors"), *stillshader = useshaderbyname("dlssgstill");
+    if(!vectorshader || !stillshader) return false;
+    matrix4 curm, prevm;
+    curm.muld(screenm, viewworld);
+    prevm.muld(prevscreen, viewworld);
+    GLint oldfbo = 0, oldviewport[4];
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &oldfbo);
+    glGetIntegerv(GL_VIEWPORT, oldviewport);
+    glBindFramebufferreal(GL_FRAMEBUFFER, fbo);
+    bool stencil = gdepthformat && useavatarmask();
+    // full screen passes: the scene's depth must stay as it is
+    GLboolean depthtest = glIsEnabled(GL_DEPTH_TEST), depthwrite = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthwrite);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, w, h);
+    static const GLenum drawbufs[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    glDrawBuffers_(2, drawbufs);
+    vectorshader->set();
+    LOCALPARAM(curmatrix, curm);
+    LOCALPARAM(prevmatrix, prevm);
+    glActiveTexture_(GL_TEXTURE0);
+    if(msaalight) glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, msdepthtex);
+    else glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
+    screenquad(w, h);
+    glstencilstate oldstencil;
+    if(stencil)
+    {
+        // the first person model moves with the camera, so on screen it holds still
+        oldstencil.save();
+        bindgdepth(); // only for its stencil, which marks the first person model
+        glDrawBuffers_(1, drawbufs);
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 0x40, 0x40);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        stillshader->set();
+        screenquad(w, h);
+        oldstencil.restore();
+        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+    }
+    glDrawBuffers_(1, drawbufs);
+    if(depthtest) glEnable(GL_DEPTH_TEST);
+    glDepthMask(depthwrite);
+    glBindFramebufferreal(GL_FRAMEBUFFER, oldfbo);
+    glViewport(oldviewport[0], oldviewport[1], oldviewport[2], oldviewport[3]);
+    return true;
+}
+
 void vk_capturefg()
 {
     if(!vkactive || framedone || drawtex) return;
@@ -1441,55 +1499,9 @@ void vk_capturefg()
         fgprevscreen = screenm;
     }
 
-    // lazy shaders only exist once something asks for them by name
-    Shader *vectorshader = useshaderbyname("dlssgvectors"), *stillshader = useshaderbyname("dlssgstill");
-    if(!vectorshader || !stillshader) return;
-
-    // motion to where each pixel was last frame, in pixels, and depth as the depth buffer holds it
-    matrix4 curm, prevm;
-    curm.muld(screenm, viewworld);
-    prevm.muld(fgprevscreen, viewworld);
-    GLint oldviewport[4];
-    glGetIntegerv(GL_VIEWPORT, oldviewport);
+    if(!vk_drawmotion(f.fgfbo, gw, gh, screenm, fgprevscreen)) return;
     glBindFramebufferreal(GL_FRAMEBUFFER, f.fgfbo);
-    bool stencil = gdepthformat && useavatarmask();
-    // full screen passes: the scene's depth must stay as it is
-    GLboolean depthtest = glIsEnabled(GL_DEPTH_TEST), depthwrite = GL_TRUE;
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthwrite);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glViewport(0, 0, gw, gh);
     static const GLenum drawbufs[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-    glDrawBuffers_(2, drawbufs);
-    vectorshader->set();
-    LOCALPARAM(curmatrix, curm);
-    LOCALPARAM(prevmatrix, prevm);
-    glActiveTexture_(GL_TEXTURE0);
-    if(msaalight) glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, msdepthtex);
-    else glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
-    screenquad(gw, gh);
-    glstencilstate oldstencil;
-    if(stencil)
-    {
-        oldstencil.save();
-        bindgdepth(); // only for its stencil, which marks the first person model
-    }
-    if(stencil)
-    {
-        // the first person model moves with the camera, so on screen it holds still
-        glDrawBuffers_(1, drawbufs);
-        glEnable(GL_STENCIL_TEST);
-        glStencilFunc(GL_EQUAL, 0x40, 0x40);
-        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-        stillshader->set();
-        screenquad(gw, gh);
-        oldstencil.restore();
-        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
-        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
-    }
-    if(depthtest) glEnable(GL_DEPTH_TEST);
-    glDepthMask(depthwrite);
-    glDrawBuffers_(1, drawbufs);
     if(dbgvkfg)
     {
         float *motion = new float[gw*gh*2], *depth = new float[gw*gh];
@@ -1514,7 +1526,6 @@ void vk_capturefg()
         delete[] depth;
     }
     glBindFramebufferreal(GL_FRAMEBUFFER, screenfbo);
-    glViewport(oldviewport[0], oldviewport[1], oldviewport[2], oldviewport[3]);
 
     // camera data, in Vulkan's clip space: depth from 0 to 1, and with GL's rows from the bottom the y axis already
     // runs the way Vulkan's does

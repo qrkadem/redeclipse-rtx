@@ -4622,7 +4622,7 @@ void rendercsmshadowmaps()
 
     csm.setup();
 
-    bool envshadow = hasenvshadow() && smalpha;
+    bool envshadow = hasenvshadow() && smalpha, rtworld = vkrt_sunready() && !drawtex;
 
     shadowmapping = SM_CASCADE;
     shadoworigin = vec(0, 0, 0);
@@ -4642,7 +4642,8 @@ void rendercsmshadowmaps()
 
     findshadowvas(smalpha && alphashadow);
     if(shadowtransparent || envshadow) csm.rendered = 2;
-    findshadowmms();
+    if(rtworld) clearshadowmms(); // map models are traced along with the world
+    else findshadowmms();
 
     shadowmaskbatchedmodels(smdynshadow!=0);
     batchshadowmapmodels();
@@ -4661,7 +4662,7 @@ void rendercsmshadowmaps()
 
         shadowside = i;
 
-        rendershadowmapworld();
+        if(!rtworld) rendershadowmapworld(); // with ray traced sun shadows the world's shadow is traced, models and grass stay here
         rendershadowgrass(1/split.scale.x);
         rendershadowmodelbatches();
     }

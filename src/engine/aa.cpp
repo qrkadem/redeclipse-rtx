@@ -681,7 +681,13 @@ void jitteraa()
 {
     nojittermatrix = projmatrix;
 
-    if(!drawtex && tqaa)
+    if(vk_dlssactive())
+    {
+        // DLSS gathers a longer sequence of offsets than TQAA's two
+        vec2 jitter = vk_dlssjitter();
+        projmatrix.jitter(jitter.x*2.0f/vieww, jitter.y*2.0f/viewh);
+    }
+    else if(!drawtex && tqaa)
     {
         vec2 jitter = tqaaframe&1 ? vec2(0.25f, 0.25f) : vec2(-0.25f, -0.25f);
         if(multisampledaa()) { jitter.x *= 0.5f; jitter.y *= -0.5f; }
@@ -744,7 +750,12 @@ bool maskedaa()
 
 void doaa(GLuint outfbo, void (*resolve)(GLuint, int))
 {
-    if(smaa)
+    if(vk_dlssactive())
+    {
+        resolve(vk_dlssinput(), AA_UNUSED);
+        vk_dlssapply(outfbo);
+    }
+    else if(smaa)
     {
         bool split = multisampledaa();
         resolve(smaafbo[0], smaatype);

@@ -271,8 +271,90 @@ namespace vk
         return true;
     }
 
+    // DLSS super resolution
+    static NVSDK_NGX_Handle *srhandle = NULL;
+    static NVSDK_NGX_Parameter *srparams = NULL;
+    static int srw = 0, srh = 0, sroutw = 0, srouth = 0, srquality = -1;
+    static bool srfailed = false;
+
+    void ngx_srrelease()
+    {
+        if(srhandle) NVSDK_NGX_VULKAN_ReleaseFeature(srhandle);
+        srhandle = NULL;
+        if(srparams) NVSDK_NGX_VULKAN_DestroyParameters(srparams);
+        srparams = NULL;
+        srw = srh = sroutw = srouth = 0;
+        srquality = -1;
+    }
+
+    bool ngx_srready(int w, int h, int outw, int outh, int quality)
+    {
+        if(!ngxinited || !dlssavailable) return false;
+        if(srw == w && srh == h && sroutw == outw && srouth == outh && srquality == quality) return srhandle != NULL && !srfailed;
+        ngx_srrelease();
+        srw = w;
+        srh = h;
+        sroutw = outw;
+        srouth = outh;
+        srquality = quality;
+        srfailed = true;
+        if(NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&srparams)) || !srparams) return false;
+        VkCommandBuffer cmd = begincommands();
+        if(!cmd) return false;
+        NVSDK_NGX_DLSS_Create_Params cp;
+        memset(&cp, 0, sizeof(cp));
+        cp.Feature.InWidth = w;
+        cp.Feature.InHeight = h;
+        cp.Feature.InTargetWidth = outw;
+        cp.Feature.InTargetHeight = outh;
+        cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value(quality);
+        cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes; // motion vectors at the render size, without jitter, colour already tonemapped
+        NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &srhandle, srparams, &cp);
+        bool ok = endcommands(cmd);
+        if(NVSDK_NGX_FAILED(r) || !ok || !srhandle)
+        {
+            conoutf(colourred, "DLSS: super resolution could not start for %dx%d to %dx%d (0x%X)", w, h, outw, outh, unsigned(r));
+            srhandle = NULL;
+            return false;
+        }
+        srfailed = false;
+        conoutf(colourwhite, "DLSS: super resolution ready, %dx%d to %dx%d", w, h, outw, outh);
+        return true;
+    }
+
+    bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in)
+    {
+        if(!srhandle || srfailed) return false;
+        NVSDK_NGX_Resource_VK color = ngxresource(in.color->image, in.color->view, in.color->format, in.color->w, in.color->h, false),
+                              output = ngxresource(in.output->image, in.output->view, in.output->format, in.output->w, in.output->h, true),
+                              depth = ngxresource(in.depth->image, in.depth->view, in.depth->format, in.depth->w, in.depth->h, false),
+                              mvec = ngxresource(in.mvec->image, in.mvec->view, in.mvec->format, in.mvec->w, in.mvec->h, false);
+        NVSDK_NGX_VK_DLSS_Eval_Params ep;
+        memset(&ep, 0, sizeof(ep));
+        ep.Feature.pInColor = &color;
+        ep.Feature.pInOutput = &output;
+        ep.pInDepth = &depth;
+        ep.pInMotionVectors = &mvec;
+        ep.InJitterOffsetX = in.jitterx;
+        ep.InJitterOffsetY = in.jittery;
+        ep.InRenderSubrectDimensions.Width = in.color->w;
+        ep.InRenderSubrectDimensions.Height = in.color->h;
+        ep.InReset = in.reset ? 1 : 0;
+        ep.InMVScaleX = ep.InMVScaleY = 1;
+        ep.InPreExposure = ep.InExposureScale = 1;
+        NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, srhandle, srparams, &ep);
+        if(NVSDK_NGX_FAILED(r))
+        {
+            conoutf(colourred, "DLSS: super resolution failed (0x%X), turning it off", unsigned(r));
+            srfailed = true;
+            return false;
+        }
+        return true;
+    }
+
     void ngx_shutdown()
     {
+        ngx_srrelease();
         ngx_fgrelease();
         if(ngxcaps) NVSDK_NGX_VULKAN_DestroyParameters(ngxcaps);
         ngxcaps = NULL;
@@ -289,6 +371,9 @@ namespace vk
     void ngx_init() {}
     void ngx_shutdown() {}
     int ngx_fgmaxgen() { return 0; }
+    bool ngx_srready(int w, int h, int outw, int outh, int quality) { return false; }
+    bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in) { return false; }
+    void ngx_srrelease() {}
     bool ngx_fgready(int w, int h, int renderw, int renderh) { return false; }
     bool ngx_fgevaluate(VkCommandBuffer cmd, const fginputs &in, int numgen) { return false; }
     void ngx_fgrelease() {}

@@ -2515,6 +2515,7 @@ void gl_drawframe()
     farplane = worldsize*farplanescale;
     if(!noview)
     {
+        vk_dlssnextjitter();
         gl_drawview();
         vk_capturefg();
     }

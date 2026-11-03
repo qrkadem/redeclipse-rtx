@@ -98,7 +98,17 @@ namespace vk
     static accelstruct worldblas, tlas;
     static rtbuffer worldverts, instances;
     static bool worlddirty = true, haveworld = false, rtloaded = false, rtfailed = false;
-    static int worldtris = 0;
+    static int worldtris = 0, modeltris = 0, modelinstances = 0;
+
+    // a map model's triangles, from its collision meshes, built once and placed by every entity using it
+    struct rtmodel
+    {
+        model *m;
+        accelstruct blas;
+        rtbuffer verts;
+        int tris;
+    };
+    static vector<rtmodel *> rtmodels;
 
     // per frame images: GL draws positions and normals, Vulkan writes the result, history stays on Vulkan's side
     static sharedimage rtpos, rtnormal, rtresult;
@@ -241,6 +251,17 @@ namespace vk
         return true;
     }
 
+    // the models' structures stay for the next rebuild, models stay loaded for the whole game
+    static void destroymodels()
+    {
+        loopv(rtmodels)
+        {
+            destroyaccel(rtmodels[i]->blas);
+            destroybuffer(rtmodels[i]->verts);
+        }
+        rtmodels.deletecontents();
+    }
+
     static void destroyworld()
     {
         destroyaccel(tlas);
@@ -248,7 +269,7 @@ namespace vk
         destroybuffer(worldverts);
         destroybuffer(instances);
         haveworld = false;
-        worldtris = 0;
+        worldtris = modeltris = modelinstances = 0;
     }
 
     static bool buildaccel(VkCommandBuffer cmd, accelstruct &a, VkAccelerationStructureTypeKHR type, const VkAccelerationStructureGeometryKHR &geom, uint32_t prims, rtbuffer &scratch)
@@ -288,10 +309,74 @@ namespace vk
         return true;
     }
 
-    // the world's opaque triangles, as the vertex arrays hold them
+    static bool buildtriangles(VkCommandBuffer cmd, accelstruct &blas, rtbuffer &vbuf, const vector<vec> &verts, rtbuffer &scratch)
+    {
+        if(!createbuffer(vbuf, verts.length()*sizeof(vec), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true)) return false;
+        memcpy(vbuf.mapped, verts.getbuf(), verts.length()*sizeof(vec));
+        VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
+        geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        geom.geometry.triangles.vertexData.deviceAddress = vbuf.addr;
+        geom.geometry.triangles.vertexStride = sizeof(vec);
+        geom.geometry.triangles.maxVertex = verts.length()-1;
+        geom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
+        return buildaccel(cmd, blas, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geom, verts.length()/3, scratch);
+    }
+
+    static rtmodel *getrtmodel(model *m, VkCommandBuffer cmd, vector<rtbuffer> &scratch)
+    {
+        loopv(rtmodels) if(rtmodels[i]->m == m) return rtmodels[i]->blas.as ? rtmodels[i] : NULL;
+        rtmodel *rm = new rtmodel;
+        rm->m = m;
+        rm->tris = 0;
+        rtmodels.add(rm);
+        BIH *bih = m->bih ? m->bih : m->setBIH();
+        if(!bih) return NULL;
+        vector<vec> verts;
+        loopi(bih->nummeshes)
+        {
+            // what is drawn and solid; leaves and other alpha tested parts would block too much
+            const BIH::mesh &mesh = bih->meshes[i];
+            if(!(mesh.flags&BIH::MESH_RENDER) || mesh.flags&BIH::MESH_ALPHA) continue;
+            loopj(mesh.numtris) loopk(3) verts.add(mesh.xform.transform(mesh.getpos(mesh.tris[j].vert[k])));
+        }
+        if(verts.length() < 3 || !buildtriangles(cmd, rm->blas, rm->verts, verts, scratch.add())) return NULL;
+        rm->tris = verts.length()/3;
+        return rm;
+    }
+
+    // where a map model entity puts its model, as mmintersect works it out the other way
+    static void mapmodeltransform(const extentity &e, VkTransformMatrixKHR &t)
+    {
+        float size = e.attrs[5] ? e.attrs[5]/100.0f : 1.0f;
+        int yaw = e.attrs[1], pitch = e.attrs[2], roll = e.attrs[3];
+        vec axes[3] = { vec(1, 0, 0), vec(0, 1, 0), vec(0, 0, 1) };
+        loopi(3)
+        {
+            vec &v = axes[i];
+            if(roll) v.rotate_around_y(sincosmod360(-roll));
+            if(pitch) v.rotate_around_x(sincosmod360(pitch));
+            if(yaw) v.rotate_around_z(sincosmod360(yaw));
+            v.mul(size);
+        }
+        loopj(3)
+        {
+            t.matrix[j][0] = axes[0][j];
+            t.matrix[j][1] = axes[1][j];
+            t.matrix[j][2] = axes[2][j];
+            t.matrix[j][3] = e.o[j];
+        }
+    }
+
+    static int lastbuild = 0;
+
+    // the world's opaque triangles, as the vertex arrays hold them, and the map models
     static bool buildworld()
     {
         worlddirty = false;
+        lastbuild = totalmillis;
         queueidle();
         destroyworld();
 
@@ -310,42 +395,53 @@ namespace vk
         if(verts.length() < 3) return false;
         uint32_t tris = verts.length()/3;
 
-        if(!createbuffer(worldverts, verts.length()*sizeof(vec), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true)) return false;
-        memcpy(worldverts.mapped, verts.getbuf(), verts.length()*sizeof(vec));
-
         VkCommandBuffer cmd = begincommands();
         if(!cmd) return false;
-        rtbuffer scratch[2];
-        VkAccelerationStructureGeometryKHR geom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
-        geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-        geom.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-        geom.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        geom.geometry.triangles.vertexData.deviceAddress = worldverts.addr;
-        geom.geometry.triangles.vertexStride = sizeof(vec);
-        geom.geometry.triangles.maxVertex = verts.length()-1;
-        geom.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
-        bool ok = buildaccel(cmd, worldblas, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, geom, tris, scratch[0]);
+        vector<rtbuffer> scratch;
+        bool ok = buildtriangles(cmd, worldblas, worldverts, verts, scratch.add());
 
-        if(ok) ok = createbuffer(instances, sizeof(VkAccelerationStructureInstanceKHR), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
+        vector<VkAccelerationStructureInstanceKHR> insts;
         if(ok)
         {
-            VkAccelerationStructureInstanceKHR inst;
+            VkAccelerationStructureInstanceKHR &inst = insts.add();
             memset(&inst, 0, sizeof(inst));
             inst.transform.matrix[0][0] = inst.transform.matrix[1][1] = inst.transform.matrix[2][2] = 1;
             inst.mask = 0xFF;
             inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             inst.accelerationStructureReference = worldblas.addr;
-            memcpy(instances.mapped, &inst, sizeof(inst));
+
+            const vector<extentity *> &ents = entities::getents();
+            loopv(ents)
+            {
+                const extentity &e = *ents[i];
+                if(e.type != ET_MAPMODEL || e.flags&(EF_NOSHADOW|EF_NOVIS)) continue;
+                model *m = loadmapmodel(e.attrs[0]);
+                if(!m) continue;
+                rtmodel *rm = getrtmodel(m, cmd, scratch);
+                if(!rm) continue;
+                VkAccelerationStructureInstanceKHR &mi = insts.add();
+                memset(&mi, 0, sizeof(mi));
+                mapmodeltransform(e, mi.transform);
+                mi.mask = 0xFF;
+                mi.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+                mi.accelerationStructureReference = rm->blas.addr;
+                modeltris += rm->tris;
+                modelinstances++;
+            }
+        }
+
+        if(ok) ok = createbuffer(instances, insts.length()*sizeof(VkAccelerationStructureInstanceKHR), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
+        if(ok)
+        {
+            memcpy(instances.mapped, insts.getbuf(), insts.length()*sizeof(VkAccelerationStructureInstanceKHR));
             VkAccelerationStructureGeometryKHR igeom = { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR };
             igeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
             igeom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
             igeom.geometry.instances.data.deviceAddress = instances.addr;
-            ok = buildaccel(cmd, tlas, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, igeom, 1, scratch[1]);
+            ok = buildaccel(cmd, tlas, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, igeom, insts.length(), scratch.add());
         }
         ok = endcommands(cmd) && ok;
-        destroybuffer(scratch[0]);
-        destroybuffer(scratch[1]);
+        loopv(scratch) destroybuffer(scratch[i]);
         if(!ok)
         {
             conoutf(colourred, "Ray tracing: could not build the world's acceleration structure");
@@ -354,7 +450,7 @@ namespace vk
         }
         worldtris = tris;
         haveworld = true;
-        if(dbgrt) conoutf(colourwhite, "Ray tracing: world of %d triangles", worldtris);
+        if(dbgrt) conoutf(colourwhite, "Ray tracing: world of %d triangles, %d map models of %d triangles", worldtris, modelinstances, modeltris);
         return true;
     }
 
@@ -479,6 +575,7 @@ ICOMMAND(0, rtdump, "s", (char *name), copystring(rtdumpname, *name ? name : "rt
 bool vkrt_aoavailable() { return rtao && vkactive && hasrt && !rtfailed; }
 bool vkrt_sunavailable() { return rtsun && vkactive && hasrt && !rtfailed; }
 bool vkrt_active() { return rtfresh; }
+bool vkrt_sunready() { return vkrt_sunavailable() && haveworld && rtloaded; }
 // nothing occluded, for when no result was traced yet
 static GLuint rtwhitetex = 0;
 GLuint vkrt_texture()
@@ -514,6 +611,7 @@ void vkrt_shutdown()
     if(!device) return;
     queueidle();
     destroyworld();
+    destroymodels();
     loopi(2)
     {
         if(rtfences[i]) vkDestroyFence(device, rtfences[i], NULL);
@@ -542,7 +640,8 @@ void vkrt_trace()
     rtfresh = false;
     bool doao = vkrt_aoavailable(), dosun = vkrt_sunavailable() && !getpielight().iszero();
     if((!doao && !dosun) || drawtex || !loadrt()) return;
-    if(worlddirty)
+    // editing changes the world piece by piece, so it is rebuilt a few times a second at most
+    if(worlddirty && (!editmode || !haveworld || totalmillis - lastbuild >= 250))
     {
         bool had = haveworld;
         buildworld();
@@ -729,6 +828,6 @@ ICOMMAND(0, rtinfo, "", (),
 {
     if(!vkactive || !hasrt) { conoutf(colourwhite, "Ray tracing: not available"); return; }
     const vec &sundir = getpielightdir();
-    conoutf(colourwhite, "Ray tracing: world %d triangles, images %dx%d, ao %s, sun %s (towards %.2f %.2f %.2f%s)%s", worldtris, rtw, rth,
+    conoutf(colourwhite, "Ray tracing: world %d triangles, %d map models of %d triangles, images %dx%d, ao %s, sun %s (towards %.2f %.2f %.2f%s)%s", worldtris, modelinstances, modeltris, rtw, rth,
         vkrt_aoavailable() ? "on" : "off", vkrt_sunavailable() ? "on" : "off", sundir.x, sundir.y, sundir.z, getpielight().iszero() ? ", no sunlight" : "", rtfailed ? ", failed" : "");
 });

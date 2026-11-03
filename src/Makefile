@@ -352,6 +352,7 @@ CLIENT_OBJS = \
     engine/texture.o \
     engine/ui.o \
     engine/vk.o \
+    engine/vkdlss.o \
     engine/vkrt.o \
     engine/water.o \
     engine/world.o \
@@ -1177,3 +1178,4 @@ engine/vkrt.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/t
 # Vulkan compute shaders, built into headers holding their SPIR-V
 engine/vkshaders/%.spv.h: engine/vkshaders/%.comp
 	glslc --target-env=vulkan1.3 -O -mfmt=c -o $@ $<
+engine/vkdlss.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h

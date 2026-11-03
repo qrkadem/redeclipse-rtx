@@ -1446,6 +1446,7 @@ void rendershadowmapworld()
 }
 
 static octaentities *shadowmms = NULL;
+void clearshadowmms() { shadowmms = NULL; } // no map models in this shadow map
 
 void findshadowmms()
 {

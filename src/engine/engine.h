@@ -496,6 +496,7 @@ extern void cleanupvolumetric();
 
 extern void findshadowvas(bool transparent = false);
 extern void findshadowmms();
+extern void clearshadowmms();
 
 extern int calcshadowinfo(const extentity &e, vec &origin, float &radius, vec &spotloc, int &spotangle, float &bias);
 extern int dynamicshadowvas();

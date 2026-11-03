@@ -203,6 +203,7 @@ int spotlights = 0, volumetriclights = 0, nospeclights = 0, smalphalights = 0, v
 static bool modifyoctaent(int flags, int id, extentity &e)
 {
     if(flags&MODOE_ADD ? e.flags&EF_OCTA : !(e.flags&EF_OCTA)) return false;
+    if(e.type == ET_MAPMODEL) vkrt_worldchanged(); // map models are in the ray traced scene
 
     ivec o, r;
     if(!getentboundingbox(e, o, r)) return false;

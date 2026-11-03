@@ -24,10 +24,22 @@ extern void vk_capturefg();         // after the scene: motion vectors and depth
 extern void vk_capturehudless();    // once the scene is on screen and before the HUD goes over it
 extern void vk_setvsync(int vsync, int tear);
 
+extern bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, const matrix4 &prevscreen);
+
+// DLSS anti-aliasing, see vkdlss.cpp
+extern bool vk_dlssactive();
+extern void vk_dlssnextjitter();
+extern vec2 vk_dlssjitter();       // render pixels
+extern GLuint vk_dlssinput();      // where the tonemapped frame goes
+extern void vk_dlssapply(GLuint outfbo);
+extern void vk_dlsscleanupgl();
+extern void vk_dlssshutdown();
+
 // ray tracing, see vkrt.cpp
 extern bool vkrt_aoavailable();  // ray traced ambient occlusion is wanted and possible: picks the lighting shaders
 extern bool vkrt_sunavailable(); // the same for the sun's shadow
 extern bool vkrt_active();       // traced this frame, so the result can be read
+extern bool vkrt_sunready();     // the world's sun shadow comes from ray tracing, the shadow map keeps the rest
 extern GLuint vkrt_texture();    // the result for GL's lighting: r ambient occlusion, g sun shadow
 extern void vkrt_trace();        // between the G-buffer and lighting
 extern void vkrt_worldchanged();

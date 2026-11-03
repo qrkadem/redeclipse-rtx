@@ -116,6 +116,17 @@ namespace vk
         deviceimage *interp; // one per generated frame
         fgcamera camera;
     };
+    // DLSS super resolution: color, motion and depth at the render size, output at the display size
+    struct srinputs
+    {
+        sharedimage *color, *mvec, *depth, *output;
+        float jitterx, jittery; // render pixels, the way the motion vectors run
+        bool reset;
+    };
+    extern bool ngx_srready(int w, int h, int outw, int outh, int quality);
+    extern bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in);
+    extern void ngx_srrelease();
+
     extern int ngx_fgmaxgen(); // 0 without frame generation
     extern bool ngx_fgready(int w, int h, int renderw, int renderh); // creates the feature for these sizes if needed
     extern bool ngx_fgevaluate(VkCommandBuffer cmd, const fginputs &in, int numgen);
