@@ -139,6 +139,7 @@ namespace vk
     static NVSDK_NGX_Handle *fghandle = NULL;
     static NVSDK_NGX_Parameter *fgparams = NULL;
     static int fgw = 0, fgh = 0, fgrw = 0, fgrh = 0;
+    static VkFormat fgformat = VK_FORMAT_UNDEFINED;
     static bool fgfailed = false;
 
     int ngx_fgmaxgen() { return ngxinited ? dlssgavailable : 0; }
@@ -150,18 +151,20 @@ namespace vk
         if(fgparams) NVSDK_NGX_VULKAN_DestroyParameters(fgparams);
         fgparams = NULL;
         fgw = fgh = fgrw = fgrh = 0;
+        fgformat = VK_FORMAT_UNDEFINED;
     }
 
-    bool ngx_fgready(int w, int h, int rw, int rh)
+    bool ngx_fgready(int w, int h, int rw, int rh, VkFormat format)
     {
         if(!ngxinited || !dlssgavailable) return false;
-        if(fgw == w && fgh == h && fgrw == rw && fgrh == rh) return fghandle != NULL && !fgfailed;
+        if(fgw == w && fgh == h && fgrw == rw && fgrh == rh && fgformat == format) return fghandle != NULL && !fgfailed;
         // the caller made sure nothing in flight uses the old feature
         ngx_fgrelease();
         fgw = w;
         fgh = h;
         fgrw = rw;
         fgrh = rh;
+        fgformat = format;
         fgfailed = true;
         if(NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&fgparams)) || !fgparams)
         {
@@ -174,7 +177,7 @@ namespace vk
         memset(&cp, 0, sizeof(cp));
         cp.Width = w;
         cp.Height = h;
-        cp.NativeBackbufferFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        cp.NativeBackbufferFormat = format;
         cp.RenderWidth = rw;
         cp.RenderHeight = rh;
         cp.DynamicResolutionScaling = false;
@@ -187,7 +190,7 @@ namespace vk
             return false;
         }
         fgfailed = false;
-        conoutf(colourwhite, "DLSS: frame generation ready for %dx%d, motion and depth %dx%d", w, h, rw, rh);
+        conoutf(colourwhite, "DLSS: frame generation ready for %dx%d%s, motion and depth %dx%d", w, h, format == VK_FORMAT_R8G8B8A8_UNORM ? "" : " HDR", rw, rh);
         return true;
     }
 
@@ -200,11 +203,11 @@ namespace vk
     bool ngx_fgevaluate(VkCommandBuffer cmd, const fginputs &in, int numgen)
     {
         if(!fghandle || fgfailed) return false;
-        NVSDK_NGX_Resource_VK backbuffer = ngxresource(in.backbuffer->image, in.backbuffer->view, in.backbuffer->format, in.backbuffer->w, in.backbuffer->h, false),
+        NVSDK_NGX_Resource_VK backbuffer = ngxresource(in.backbuffer.image, in.backbuffer.view, in.backbuffer.format, in.backbuffer.w, in.backbuffer.h, false),
                               depth = ngxresource(in.depth->image, in.depth->view, in.depth->format, in.depth->w, in.depth->h, false),
                               mvec = ngxresource(in.mvec->image, in.mvec->view, in.mvec->format, in.mvec->w, in.mvec->h, false),
                               hudless;
-        if(in.hudless) hudless = ngxresource(in.hudless->image, in.hudless->view, in.hudless->format, in.hudless->w, in.hudless->h, false);
+        if(in.hashudless) hudless = ngxresource(in.hudless.image, in.hudless.view, in.hudless.format, in.hudless.w, in.hudless.h, false);
         static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
         for(int g = 0; g < numgen; g++)
         {
@@ -215,7 +218,7 @@ namespace vk
             ep.pBackbuffer = &backbuffer;
             ep.pDepth = &depth;
             ep.pMVecs = &mvec;
-            ep.pHudless = in.hudless ? &hudless : NULL;
+            ep.pHudless = in.hashudless ? &hudless : NULL;
             ep.pOutputInterpFrame = &interp;
 
             NVSDK_NGX_DLSSG_Opt_Eval_Params op;
@@ -237,7 +240,7 @@ namespace vk
             op.cameraFar = in.camera.farplane;
             op.cameraFOV = in.camera.fov;
             op.cameraAspectRatio = in.camera.aspect;
-            op.colorBuffersHDR = false;
+            op.colorBuffersHDR = in.hdr;
             op.depthInverted = false;
             op.cameraMotionIncluded = true;
             op.reset = in.camera.reset;
@@ -251,13 +254,13 @@ namespace vk
             op.mvecsSubrectSize.Height = in.mvec->h;
             op.depthSubrectSize.Width = in.depth->w;
             op.depthSubrectSize.Height = in.depth->h;
-            if(in.hudless)
+            if(in.hashudless)
             {
-                op.hudLessSubrectSize.Width = in.hudless->w;
-                op.hudLessSubrectSize.Height = in.hudless->h;
+                op.hudLessSubrectSize.Width = in.hudless.w;
+                op.hudLessSubrectSize.Height = in.hudless.h;
             }
-            op.backbufferSubrectSize.Width = in.backbuffer->w;
-            op.backbufferSubrectSize.Height = in.backbuffer->h;
+            op.backbufferSubrectSize.Width = in.backbuffer.w;
+            op.backbufferSubrectSize.Height = in.backbuffer.h;
             op.outputInterpSubrectSize.Width = out.w;
             op.outputInterpSubrectSize.Height = out.h;
             NVSDK_NGX_Result r = NGX_VK_EVALUATE_DLSSG(cmd, fghandle, fgparams, &ep, &op);
@@ -374,7 +377,7 @@ namespace vk
     bool ngx_srready(int w, int h, int outw, int outh, int quality) { return false; }
     bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in) { return false; }
     void ngx_srrelease() {}
-    bool ngx_fgready(int w, int h, int renderw, int renderh) { return false; }
+    bool ngx_fgready(int w, int h, int renderw, int renderh, VkFormat format) { return false; }
     bool ngx_fgevaluate(VkCommandBuffer cmd, const fginputs &in, int numgen) { return false; }
     void ngx_fgrelease() {}
 }

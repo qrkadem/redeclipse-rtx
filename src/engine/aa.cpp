@@ -31,7 +31,7 @@ void setuptqaa(int w, int h)
         if(!tqaatex[i]) glGenTextures(1, &tqaatex[i]);
         if(!tqaafbo[i]) glGenFramebuffers_(1, &tqaafbo[i]);
         glBindFramebuffer_(GL_FRAMEBUFFER, tqaafbo[i]);
-        createtexture(tqaatex[i], w, h, NULL, 3, 1, GL_RGBA8, GL_TEXTURE_RECTANGLE);
+        createtexture(tqaatex[i], w, h, NULL, 3, 1, screenformat(GL_RGBA8), GL_TEXTURE_RECTANGLE);
         glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, tqaatex[i], 0);
         bindgdepth();
         if(glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
@@ -150,7 +150,7 @@ void setupfxaa(int w, int h)
     if(!fxaatex) glGenTextures(1, &fxaatex);
     if(!fxaafbo) glGenFramebuffers_(1, &fxaafbo);
     glBindFramebuffer_(GL_FRAMEBUFFER, fxaafbo);
-    createtexture(fxaatex, w, h, NULL, 3, 1, tqaa || (!fxaagreenluma && !intel_texalpha_bug) ? GL_RGBA8 : GL_RGB, GL_TEXTURE_RECTANGLE);
+    createtexture(fxaatex, w, h, NULL, 3, 1, screenformat(tqaa || (!fxaagreenluma && !intel_texalpha_bug) ? GL_RGBA8 : GL_RGB), GL_TEXTURE_RECTANGLE);
     glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, fxaatex, 0);
     bindgdepth();
     if(glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
@@ -519,7 +519,7 @@ void setupsmaa(int w, int h)
         GLenum format = GL_RGB;
         switch(i)
         {
-            case 0: format = tqaa || (!smaagreenluma && !intel_texalpha_bug && !smaacoloredge) ? GL_RGBA8 : GL_RGB; break;
+            case 0: format = screenformat(tqaa || (!smaagreenluma && !intel_texalpha_bug && !smaacoloredge) ? GL_RGBA8 : GL_RGB); break;
             case 1: format = GL_RG8; break;
             case 2: case 3: format = GL_RGBA8; break;
         }

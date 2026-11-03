@@ -439,7 +439,7 @@ void setupscale(int sw, int sh, int w, int h)
         // This makes visuals crisper when using `gscale 25` or `gscale 50`.
         // See <http://tanalin.com/en/articles/integer-scaling/> for rationale.
         const bool filter = docubic || gscalenearest == 0 || (gscalenearest == -1 && gscale != 25 && gscale != 50 && gscale != 100);
-        createtexture(scaletex[i], sw, i ? h : sh, NULL, 3, filter, GL_RGB, GL_TEXTURE_RECTANGLE);
+        createtexture(scaletex[i], sw, i ? h : sh, NULL, 3, filter, screenformat(GL_RGB), GL_TEXTURE_RECTANGLE);
 
         glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, scaletex[i], 0);
         if(!i) bindgdepth();

@@ -1171,7 +1171,7 @@ engine/engine.h.gch: engine/octa.h engine/light.h engine/texture.h
 engine/engine.h.gch: engine/bih.h engine/model.h engine/sound.h
 engine/engine.h.gch: engine/soundenvprop.h engine/vk.h
 
-engine/vk.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h
+engine/vk.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h engine/vkshaders/hdrencode.spv.h
 engine/ngx.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h
 engine/vkrt.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h engine/vkshaders/rttrace.spv.h engine/vkshaders/rtfilter.spv.h engine/vkshaders/rtskin.spv.h
 

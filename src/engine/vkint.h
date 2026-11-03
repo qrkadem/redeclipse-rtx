@@ -30,6 +30,7 @@ namespace vk
     extern const char *resultname(VkResult r);
 
     // an image Vulkan allocated that GL draws into or reads as a texture
+    struct deviceimage;
     struct sharedimage
     {
         VkImage image = VK_NULL_HANDLE;
@@ -39,6 +40,8 @@ namespace vk
         int w = 0, h = 0;
         GLuint glmemory = 0, gltex = 0;
         GLenum gltarget = 0, glformat = 0;
+
+        inline deviceimage device() const; // its Vulkan side, as a device image (not owning it)
     };
     extern bool createsharedimage(sharedimage &s, int w, int h, VkFormat format, GLenum glformat, GLenum gltarget = GL_TEXTURE_2D);
     extern void destroysharedimage(sharedimage &s);
@@ -69,6 +72,16 @@ namespace vk
         VkFormat format = VK_FORMAT_UNDEFINED;
         int w = 0, h = 0;
     };
+    inline deviceimage sharedimage::device() const
+    {
+        deviceimage d;
+        d.image = image;
+        d.view = view;
+        d.format = format;
+        d.w = w;
+        d.h = h;
+        return d;
+    }
     extern bool createdeviceimage(deviceimage &d, int w, int h, VkFormat format, VkImageUsageFlags usage);
     extern void destroydeviceimage(deviceimage &d);
 
@@ -113,7 +126,9 @@ namespace vk
 
     struct fginputs
     {
-        sharedimage *backbuffer, *hudless, *mvec, *depth; // hudless may be NULL
+        deviceimage backbuffer, hudless; // in HDR10 with hdr, hudless only with hashudless
+        bool hashudless = false, hdr = false;
+        sharedimage *mvec, *depth;
         deviceimage *interp; // one per generated frame
         fgcamera camera;
     };
@@ -129,7 +144,7 @@ namespace vk
     extern void ngx_srrelease();
 
     extern int ngx_fgmaxgen(); // 0 without frame generation
-    extern bool ngx_fgready(int w, int h, int renderw, int renderh); // creates the feature for these sizes if needed
+    extern bool ngx_fgready(int w, int h, int renderw, int renderh, VkFormat format); // creates the feature for these sizes and frame format if needed
     extern bool ngx_fgevaluate(VkCommandBuffer cmd, const fginputs &in, int numgen);
     extern void ngx_fgrelease();
 }

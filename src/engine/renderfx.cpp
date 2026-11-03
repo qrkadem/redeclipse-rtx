@@ -1055,6 +1055,7 @@ void VisorSurface::checkformat(int &w, int &h, GLenum &f, GLenum &t, int &n)
 {
     w = max(int((w > 0 ? w : vieww)), 1);
     h = max(int((h > 0 ? h : viewh)), 1);
+    f = screenformat(f); // the world's image goes through here on its way to the screen
 }
 
 int VisorSurface::create(int w, int h, GLenum f, GLenum t, int count)

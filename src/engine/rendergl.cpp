@@ -2499,6 +2499,7 @@ void gl_drawhud(bool noview = false)
 
 void gl_drawnoview()
 {
+    vk_updatehdr();
     vk_beginframe();
     gl_setupframe();
     hud::update(hudw, hudh);
@@ -2508,6 +2509,7 @@ void gl_drawnoview()
 void gl_drawframe()
 {
     vk_latencymark(2); // render submission starts
+    vk_updatehdr();
     vk_beginframe();
     bool noview = hasnoview();
     synctimers();

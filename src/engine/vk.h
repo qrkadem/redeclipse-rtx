@@ -25,6 +25,9 @@ extern void vk_partmotion(const void *owner, const void *part, const matrix4 &wo
 extern void vk_capturefg();         // after the scene: motion vectors and depth for frame generation
 extern void vk_capturehudless();    // once the scene is on screen and before the HUD goes over it
 extern void vk_setvsync(int vsync, int tear);
+extern void vk_updatehdr();         // the start of a frame: HDR output turns on or off
+extern bool hdrscreen;              // HDR output is on, so the tonemapped frame travels to the screen in 16 bits
+static inline GLenum screenformat(GLenum sdr) { return !hdrscreen ? sdr : (sdr == GL_RGB || sdr == GL_RGB8 ? GL_RGB16 : GL_RGBA16); }
 extern void vk_latencysleep();      // the start of a frame, before input
 extern void vk_latencymark(int marker); // VkLatencyMarkerNV: 1 simulation end, 2 render submission start, 6 input sample
 

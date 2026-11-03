@@ -65,10 +65,13 @@ namespace vk
     {
         srimagew = w;
         srimageh = h;
-        if(!createsharedimage(srcolor, w, h, VK_FORMAT_R8G8B8A8_UNORM, GL_RGBA8) ||
+        // the tonemapped frame, in 16 bits with HDR output
+        VkFormat colorvk = hdrscreen ? VK_FORMAT_R16G16B16A16_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+        GLenum colorgl = screenformat(GL_RGBA8);
+        if(!createsharedimage(srcolor, w, h, colorvk, colorgl) ||
            !createsharedimage(srmvec, w, h, VK_FORMAT_R16G16_SFLOAT, GL_RG16F) ||
            !createsharedimage(srdepth, w, h, VK_FORMAT_R32_SFLOAT, GL_R32F) ||
-           !createsharedimage(sroutput, w, h, VK_FORMAT_R8G8B8A8_UNORM, GL_RGBA8) ||
+           !createsharedimage(sroutput, w, h, colorvk, colorgl) ||
            !createsharedsemaphore(srready) || !createsharedsemaphore(srdone))
             return false;
         bool ok = makefbo(srcolorfbo, srcolor) && makefbo(srvecfbo, srmvec, &srdepth) && makefbo(sroutfbo, sroutput);

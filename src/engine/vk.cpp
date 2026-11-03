@@ -9,13 +9,30 @@
 #include "vk.h"
 #include <SDL_vulkan.h>
 
+static const uint32_t hdrencodespv[] =
+#include "vkshaders/hdrencode.spv.h"
+;
+
 VARF(IDF_INIT, vulkan, 0, 1, 1, initwarning("Vulkan presenting", INIT_RESET));
 VAR(IDF_INIT, vkvalidation, 0, 0, 1); // Khronos validation layer, for development
 VAR(0, dbgvk, 0, 0, 1);
 
 bool vkactive = false;
 extern int dlssg, refreshrate, lowlatency;
+extern float hdrgamma;
+extern void cleanupscale();
 VAR(0, gvelocity, 1, 0, 0); // the G-buffer has a velocity target that models write their motion into, see model.cfg
+
+// HDR output: HDR10 (PQ, Rec.2020) to a display that takes it. The SDR picture keeps its shadows and midtones at
+// paper white and its highlights reach up to the peak, see vkshaders/hdrencode.comp
+static SDL_atomic_t hdrmetadirty; // the display hears of a new peak at the next present
+VAR(IDF_PERSIST, hdroutput, 0, 0, 1);
+FVARF(IDF_PERSIST, hdrpeak, 100, 1000, 10000, SDL_AtomicSet(&hdrmetadirty, 1));       // the display's brightest, in nits
+FVARF(IDF_PERSIST, hdrpaperwhite, 40, 200, 1000, SDL_AtomicSet(&hdrmetadirty, 1));    // what SDR white becomes, in nits
+// how bright light must be to reach the peak, in the tonemap's terms (it shows light k as 1 - 2^-k, so 1 is half
+// white): lower makes more of the picture's highlights reach it, 15 is the most the frame's 16 bits hold
+FVAR(IDF_PERSIST, hdrrange, 6, 12, 15);
+bool hdrscreen = false; // HDR output is on: the tonemapped frame goes to the screen in 16 bits
 
 #define MAXVKFRAMES 2 // screen images GL and Vulkan take turns with
 
@@ -367,6 +384,8 @@ namespace vk
         sharedimage img, hudless, mvec, depth;
         GLuint fbo = 0, hudlessfbo = 0, fgfbo = 0;
         deviceimage interp[MAXFGGEN];
+        deviceimage hdr, hdrhudless; // with HDR output: the frame (and its copy without the HUD) in HDR10, what's presented
+        VkDescriptorSet hdrset = VK_NULL_HANDLE;
         sharedsemaphore glready, vkdone; // GL finished drawing / Vulkan finished with every image of the frame
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
@@ -394,6 +413,13 @@ namespace vk
     static VkSemaphore evaltimeline = VK_NULL_HANDLE; // counts frames Vulkan finished its own work on
     static uint64_t evalcounter = 0;
 
+    // the HDR conversion, a compute pass over each frame's images
+    static VkDescriptorSetLayout hdrsetlayout = VK_NULL_HANDLE;
+    static VkPipelineLayout hdrlayout = VK_NULL_HANDLE;
+    static VkPipeline hdrpipe = VK_NULL_HANDLE;
+    static VkDescriptorPool hdrpool = VK_NULL_HANDLE;
+    struct hdrparams { float curve[4], flags[4]; };
+
     static VkSwapchainKHR swapchain = VK_NULL_HANDLE;
 
     // low latency (VK_NV_low_latency2, what NVIDIA Reflex is on Vulkan): the main thread sleeps before taking input
@@ -414,6 +440,35 @@ namespace vk
     static SDL_atomic_t swapdirty;
     static bool hasrelaxed = false, cangrab = false;
     static int wantvsync = 0, wanttear = 0;
+
+    // HDR: the swapchain is HDR10 when the image being presented is, and the surface says whether it can be
+    static bool hascolorspace = false, hashdrmetadata = false, swaphdr = false, swapwanthdr = false;
+    static bool hassurfacemaint = false; // what VK_EXT_swapchain_maintenance1 (wanted by NGX) needs from the instance
+    static SDL_atomic_t hdrsurface;
+    static PFN_vkSetHdrMetadataEXT SetHdrMetadataEXT = NULL;
+    #define HDRFORMAT VK_FORMAT_A2B10G10R10_UNORM_PACK32 // what the HDR images are, the swapchain's may be its BGR twin
+
+    static bool ishdrformat(const VkSurfaceFormatKHR &f)
+    {
+        return f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT && (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+    }
+
+    static void sethdrmetadata()
+    {
+        SDL_AtomicSet(&hdrmetadirty, 0);
+        if(!SetHdrMetadataEXT || !swapchain) return;
+        // mastered on a Rec.2020 display with the chosen peak
+        VkHdrMetadataEXT md = { VK_STRUCTURE_TYPE_HDR_METADATA_EXT };
+        md.displayPrimaryRed = { 0.708f, 0.292f };
+        md.displayPrimaryGreen = { 0.170f, 0.797f };
+        md.displayPrimaryBlue = { 0.131f, 0.046f };
+        md.whitePoint = { 0.3127f, 0.3290f };
+        md.maxLuminance = hdrpeak;
+        md.minLuminance = 0.0001f;
+        md.maxContentLightLevel = hdrpeak;
+        md.maxFrameAverageLightLevel = hdrpaperwhite;
+        SetHdrMetadataEXT(device, 1, &swapchain, &md);
+    }
 
     static void APIENTRY bindframebuffer(GLenum target, GLuint fbo)
     {
@@ -508,16 +563,26 @@ namespace vk
         // GL wrote the values straight to its window, so a UNORM swapchain shows the same thing
         static const VkFormat preferred[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32 };
         VkSurfaceFormatKHR format = formats[0];
-        bool found = false;
+        bool found = false, hdrfound = false;
+        loopv(formats) if(ishdrformat(formats[i]))
+        {
+            hdrfound = true;
+            if(swapwanthdr && (!found || formats[i].format == HDRFORMAT))
+            {
+                format = formats[i];
+                found = true;
+            }
+        }
+        SDL_AtomicSet(&hdrsurface, hdrfound ? 1 : 0);
         loopj(int(sizeof(preferred)/sizeof(preferred[0])))
         {
+            if(found) break;
             loopv(formats) if(formats[i].format == preferred[j] && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
             {
                 format = formats[i];
                 found = true;
                 break;
             }
-            if(found) break;
         }
 
         uint32_t nummodes = 0;
@@ -567,6 +632,8 @@ namespace vk
         swapchain = newswapchain;
         if(swaplock) SDL_UnlockMutex(swaplock);
         SDL_AtomicSet(&sleepmodedirty, 1); // a new swapchain starts without its latency mode
+        swaphdr = ishdrformat(format);
+        if(swaphdr) sethdrmetadata();
         swapformat = format.format;
         swapextent = extent;
         presentmode = mode;
@@ -628,7 +695,7 @@ namespace vk
     // vkgrab: the presenting thread copies presented images back, the main thread saves them
     static string grabname = "";
     static int grabwant = 0, grabtaken = 0;
-    struct grabbedimage { ImageData *image; int index; };
+    struct grabbedimage { ImageData *image; int index; string info; };
     static vector<grabbedimage> grabbed;
     static VkBuffer grabbuf = VK_NULL_HANDLE;
     static VkDeviceMemory grabmem = VK_NULL_HANDLE;
@@ -672,11 +739,42 @@ namespace vk
         void *data = NULL;
         if(vkMapMemory(device, grabmem, 0, VK_WHOLE_SIZE, 0, &data) == VK_SUCCESS)
         {
+            string info = "";
             int w = swapextent.width, h = swapextent.height;
             ImageData *image = new ImageData(w, h, 3);
             const uchar *src = (const uchar *)data;
             bool bgr = swapformat == VK_FORMAT_B8G8R8A8_UNORM || swapformat == VK_FORMAT_B8G8R8A8_SRGB;
-            loopi(w*h)
+            if(swaphdr)
+            {
+                // HDR10: saved with the peak as white, and its light reported
+                float peak = max(float(hdrpeak), 1.0f), maxnits = 0, above = 0;
+                double sum = 0;
+                bool rfirst = swapformat == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+                loopi(w*h)
+                {
+                    uint v = ((const uint *)src)[i];
+                    float c[3] = { float(v&0x3FF), float((v>>10)&0x3FF), float((v>>20)&0x3FF) }, rgb[3];
+                    loopj(3)
+                    {
+                        // ST.2084 back to nits
+                        float e = powf(c[j]/1023.0f, 1/78.84375f);
+                        c[j] = 10000*powf(max(e - 0.8359375f, 0.0f)/(18.8515625f - 18.6875f*e), 1/0.1593017578125f);
+                    }
+                    if(!rfirst) swap(c[0], c[2]);
+                    // Rec.2020 to Rec.709
+                    rgb[0] = 1.6605f*c[0] - 0.5876f*c[1] - 0.0728f*c[2];
+                    rgb[1] = -0.1246f*c[0] + 1.1329f*c[1] - 0.0083f*c[2];
+                    rgb[2] = -0.0182f*c[0] - 0.1006f*c[1] + 1.1187f*c[2];
+                    float nits = 0.2126f*rgb[0] + 0.7152f*rgb[1] + 0.0722f*rgb[2];
+                    maxnits = max(maxnits, nits);
+                    sum += nits;
+                    if(nits > hdrpaperwhite*1.05f) above++;
+                    loopj(3) image->data[i*3+j] = uchar(clamp(powf(max(rgb[j], 0.0f)/peak, 1/2.2f)*255 + 0.5f, 0.0f, 255.0f));
+                }
+                formatstring(info, " (HDR: brightest %.0f nits, mean %.0f nits, %.1f%% above paper white at %.0f nits)",
+                    maxnits, sum/(w*h), 100*above/(w*h), float(hdrpaperwhite));
+            }
+            else loopi(w*h)
             {
                 image->data[i*3+0] = src[i*4+(bgr ? 2 : 0)];
                 image->data[i*3+1] = src[i*4+1];
@@ -687,6 +785,7 @@ namespace vk
             grabbedimage &g = grabbed.add();
             g.image = image;
             g.index = grabtaken++;
+            copystring(g.info, info);
             SDL_UnlockMutex(presentlock);
         }
         vkDestroyBuffer(device, grabbuf, NULL);
@@ -706,32 +805,55 @@ namespace vk
         {
             defformatstring(name, "%s_%d.png", grabname, done[i].index);
             saveimage(name, *done[i].image, IFMT_PNG, 9, false);
-            conoutf(colourwhite, "Vulkan: saved presented image %s", name);
+            conoutf(colourwhite, "Vulkan: saved presented image %s%s", name, done[i].info);
             delete done[i].image;
         }
     }
 
     // copies src (GL oriented, in TRANSFER_SRC layout unless real) into the next swapchain image and presents it;
-    // for the rendered image it also hands the frame's images back to GL
+    // for the rendered image it also hands the frame's screen image back to GL, unless it was HDR and that went already
     static void latencymarker(VkLatencyMarkerNV marker, uint64_t frameid);
 
-    static void presentimage(VkImage src, int srcw, int srch, screenframe *real, uint64_t frameid = 0)
+    // the swapchain is the main thread's too (latency sleep and markers), so it's only used under swaplock, and waiting
+    // for an image polls instead of holding the lock while it blocks
+    static VkResult acquireimage(VkSemaphore acquired, uint32_t &index)
+    {
+        // a hidden window (another workspace) can hold its images forever with vsync on, then frames are dropped
+        double giveup = seconds() + 0.1;
+        for(;;)
+        {
+            SDL_LockMutex(swaplock);
+            VkResult r = vkAcquireNextImageKHR(device, swapchain, 0, acquired, VK_NULL_HANDLE, &index);
+            SDL_UnlockMutex(swaplock);
+            if(r != VK_NOT_READY && r != VK_TIMEOUT) return r;
+            if(seconds() >= giveup) return VK_TIMEOUT;
+            struct timespec ts = { 0, 100000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    static void presentimage(VkImage src, int srcw, int srch, bool hdrimage, screenframe *real, uint64_t frameid = 0)
     {
         presentcmd &p = presentcmds[presentnext];
         presentnext = (presentnext+1)%PRESENTRING;
         vkWaitForFences(device, 1, &p.fence, VK_TRUE, UINT64_MAX);
 
+        if(hdrimage != swapwanthdr)
+        {
+            // the swapchain follows what's presented
+            swapwanthdr = hdrimage;
+            SDL_AtomicSet(&swapdirty, 1);
+        }
         if(SDL_AtomicGet(&swapdirty) && !createswapchain()) fprintf(stderr, "Vulkan: could not remake the swapchain\n");
+        if(swaphdr && SDL_AtomicGet(&hdrmetadirty)) sethdrmetadata();
         uint32_t index = UINT32_MAX;
         if(swapchain)
         {
-            // a hidden window (another workspace) can hold its images forever with vsync on, then frames are dropped
-            const uint64_t timeout = 100000000;
-            VkResult r = vkAcquireNextImageKHR(device, swapchain, timeout, p.acquired, VK_NULL_HANDLE, &index);
+            VkResult r = acquireimage(p.acquired, index);
             if(r == VK_ERROR_OUT_OF_DATE_KHR)
             {
                 index = UINT32_MAX;
-                if(createswapchain() && swapchain) r = vkAcquireNextImageKHR(device, swapchain, timeout, p.acquired, VK_NULL_HANDLE, &index);
+                if(createswapchain() && swapchain) r = acquireimage(p.acquired, index);
             }
             if(r == VK_SUBOPTIMAL_KHR) SDL_AtomicSet(&swapdirty, 1);
             else if(r != VK_SUCCESS) index = UINT32_MAX;
@@ -770,9 +892,9 @@ namespace vk
             imagebarrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
         }
-        if(real)
+        if(real && src == real->img.image)
         {
-            // every image of the frame goes back to GL, in the layout GL draws in
+            // the screen image goes back to GL, in the layout GL draws in
             imagebarrier(cmd, real->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
                 queuefamily, VK_QUEUE_FAMILY_EXTERNAL);
@@ -826,9 +948,11 @@ namespace vk
             pid.swapchainCount = 1;
             pid.pPresentIds = &frameid;
             if(real && frameid && haspresentid) pi.pNext = &pid;
+            SDL_LockMutex(swaplock); // the main thread's latency calls use the swapchain too
             if(real && frameid) latencymarker(VK_LATENCY_MARKER_PRESENT_START_NV, frameid);
             VkResult pr = vkQueuePresentKHR(vk::queue, &pi);
             if(real && frameid) latencymarker(VK_LATENCY_MARKER_PRESENT_END_NV, frameid);
+            SDL_UnlockMutex(swaplock);
             if(pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) SDL_AtomicSet(&swapdirty, 1);
         }
         unlockqueue();
@@ -871,10 +995,11 @@ namespace vk
             loopi(job.numgen)
             {
                 if(i) sleepuntil(start + i*step);
-                presentimage(f.interp[i].image, f.interp[i].w, f.interp[i].h, NULL);
+                presentimage(f.interp[i].image, f.interp[i].w, f.interp[i].h, f.interp[i].format == HDRFORMAT, NULL);
             }
             if(job.numgen) sleepuntil(start + job.numgen*step);
-            presentimage(f.img.image, f.img.w, f.img.h, &f, job.frameid);
+            if(f.hdr.image) presentimage(f.hdr.image, f.hdr.w, f.hdr.h, true, &f, job.frameid);
+            else presentimage(f.img.image, f.img.w, f.img.h, false, &f, job.frameid);
 
             SDL_LockMutex(presentlock);
             slotbusy[job.slot] = false;
@@ -978,14 +1103,134 @@ namespace vk
             destroysharedimage(f.mvec);
             destroysharedimage(f.depth);
             loopj(MAXFGGEN) destroydeviceimage(f.interp[j]);
+            destroydeviceimage(f.hdr);
+            destroydeviceimage(f.hdrhudless);
             destroysharedsemaphore(f.glready);
             destroysharedsemaphore(f.vkdone);
             if(f.cmd) vkFreeCommandBuffers(device, cmdpool, 1, &f.cmd);
             if(f.fence) vkDestroyFence(device, f.fence, NULL);
             f = screenframe();
         }
+        if(hdrpool) vkResetDescriptorPool(device, hdrpool, 0);
         numframes = 0;
         fgimages = false;
+    }
+
+    static void destroyhdrpipeline()
+    {
+        if(hdrpipe) vkDestroyPipeline(device, hdrpipe, NULL);
+        if(hdrlayout) vkDestroyPipelineLayout(device, hdrlayout, NULL);
+        if(hdrsetlayout) vkDestroyDescriptorSetLayout(device, hdrsetlayout, NULL);
+        if(hdrpool) vkDestroyDescriptorPool(device, hdrpool, NULL);
+        hdrpipe = VK_NULL_HANDLE;
+        hdrlayout = VK_NULL_HANDLE;
+        hdrsetlayout = VK_NULL_HANDLE;
+        hdrpool = VK_NULL_HANDLE;
+    }
+
+    static bool createhdrpipeline()
+    {
+        if(hdrpipe) return true;
+        VkDescriptorSetLayoutBinding bindings[4];
+        loopi(4)
+        {
+            bindings[i] = VkDescriptorSetLayoutBinding{};
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo dslci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        dslci.bindingCount = 4;
+        dslci.pBindings = bindings;
+        VKCHECK(vkCreateDescriptorSetLayout(device, &dslci, NULL, &hdrsetlayout));
+        VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hdrparams) };
+        VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &hdrsetlayout;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &range;
+        VKCHECK(vkCreatePipelineLayout(device, &plci, NULL, &hdrlayout));
+        VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        smci.codeSize = sizeof(hdrencodespv);
+        smci.pCode = hdrencodespv;
+        VkShaderModule module = VK_NULL_HANDLE;
+        VKCHECK(vkCreateShaderModule(device, &smci, NULL, &module));
+        VkComputePipelineCreateInfo cpci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = module;
+        cpci.stage.pName = "main";
+        cpci.layout = hdrlayout;
+        VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, NULL, &hdrpipe);
+        vkDestroyShaderModule(device, module, NULL);
+        VKCHECK(r);
+        VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4*MAXVKFRAMES };
+        VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        dpci.maxSets = MAXVKFRAMES;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &size;
+        VKCHECK(vkCreateDescriptorPool(device, &dpci, NULL, &hdrpool));
+        return true;
+    }
+
+    // the HDR curve for hdrencode.comp: the frame's light k (the tonemap showed 1 - 2^-k) is shown as it was up to the
+    // knee, then rises to the peak at the light hdrrange names. The knee moves down when the peak is too far to reach
+    // from it without the curve getting steeper than the tonemap's own.
+    static void hdrcurve(float &knee, float &soft)
+    {
+        const float maxlight = hdrrange;
+        float peak = max(hdrpeak/hdrpaperwhite, 1.0f); // in paper whites
+        // the most a straight line leaving the knee as steeply as the tonemap reaches
+        #define REACH(t) ((t) + M_LN2*(1 - (t))*(maxlight + log2f(1 - (t))))
+        knee = 0.5f;
+        if(REACH(knee) < peak*1.01f)
+        {
+            float lo = 0, hi = 0.5f;
+            loopi(30)
+            {
+                float mid = 0.5f*(lo + hi);
+                if(REACH(mid) < peak*1.01f) hi = mid; else lo = mid;
+            }
+            knee = lo;
+        }
+        #undef REACH
+        // soft s from s(1 - 2^(-range/s)) = (peak - knee)/(1 - knee), which grows with s up to range*ln2
+        float range = maxlight + log2f(1 - knee), want = (peak - knee)/(1 - knee);
+        if(want >= range*M_LN2*0.999f) { soft = 1e4f; return; }
+        float lo = 1e-3f, hi = 1e4f;
+        loopi(60)
+        {
+            float mid = sqrtf(lo*hi);
+            if(mid*(1 - exp2f(-range/mid)) < want) lo = mid; else hi = mid;
+        }
+        soft = sqrtf(lo*hi);
+    }
+
+    // the HDR conversion reads the screen image and its copy without the HUD and writes their HDR10 versions
+    static bool createhdrset(screenframe &f)
+    {
+        VkDescriptorSetAllocateInfo dsai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dsai.descriptorPool = hdrpool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &hdrsetlayout;
+        VKCHECK(vkAllocateDescriptorSets(device, &dsai, &f.hdrset));
+        // bindings without an image of their own get one the shader leaves alone
+        VkImageView views[4] = { f.img.view, f.hudless.view ? f.hudless.view : f.img.view, f.hdr.view, f.hdrhudless.view ? f.hdrhudless.view : f.hdr.view };
+        VkDescriptorImageInfo infos[4];
+        VkWriteDescriptorSet writes[4];
+        loopi(4)
+        {
+            infos[i] = VkDescriptorImageInfo{ VK_NULL_HANDLE, views[i], VK_IMAGE_LAYOUT_GENERAL };
+            writes[i] = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[i].dstSet = f.hdrset;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[i].pImageInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(device, 4, writes, 0, NULL);
+        return true;
     }
 
     static bool createframebuffer(GLuint &fbo, sharedimage &color0, sharedimage *color1 = NULL)
@@ -1005,21 +1250,33 @@ namespace vk
     // gw and gh are the frame generation input size, the G-buffer's
     static bool createframes(int w, int h, int fgw, int fgh)
     {
-        bool wantfg = dlssg && ngx_fgmaxgen() > 0 && fgw > 0 && fgh > 0;
+        bool wantfg = dlssg && ngx_fgmaxgen() > 0 && fgw > 0 && fgh > 0, wanthdr = hdrscreen;
         int numinterp = min(dlssg < 0 ? ngx_fgmaxgen() : int(dlssg), MAXFGGEN); // automatic makes room for the most
+        if(wanthdr && !createhdrpipeline()) return false;
+        // with HDR the frame comes in 16 bits, for the light in its highlights, and gets an HDR10 copy that's presented
+        VkFormat screenvk = wanthdr ? VK_FORMAT_R16G16B16A16_UNORM : VK_FORMAT_R8G8B8A8_UNORM, outvk = wanthdr ? HDRFORMAT : VK_FORMAT_R8G8B8A8_UNORM;
+        GLenum screengl = wanthdr ? GL_RGBA16 : GL_RGBA8;
+        const VkImageUsageFlags outusage = VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         loopi(MAXVKFRAMES)
         {
             screenframe &f = frames[i];
             numframes = i+1;
-            if(!createsharedimage(f.img, w, h, VK_FORMAT_R8G8B8A8_UNORM, GL_RGBA8) || !createframebuffer(f.fbo, f.img)) return false;
+            if(!createsharedimage(f.img, w, h, screenvk, screengl) || !createframebuffer(f.fbo, f.img)) return false;
+            // the frame without the HUD, for frame generation and for HDR to leave the HUD alone
+            if((wantfg || wanthdr) && (!createsharedimage(f.hudless, w, h, screenvk, screengl) || !createframebuffer(f.hudlessfbo, f.hudless))) return false;
+            if(wanthdr)
+            {
+                if(!createdeviceimage(f.hdr, w, h, HDRFORMAT, outusage)) return false;
+                if(wantfg && !createdeviceimage(f.hdrhudless, w, h, HDRFORMAT, outusage)) return false;
+                if(!createhdrset(f)) return false;
+            }
             if(wantfg)
             {
-                if(!createsharedimage(f.hudless, w, h, VK_FORMAT_R8G8B8A8_UNORM, GL_RGBA8) || !createframebuffer(f.hudlessfbo, f.hudless)) return false;
                 if(!createsharedimage(f.mvec, fgw, fgh, VK_FORMAT_R16G16_SFLOAT, GL_RG16F) ||
                    !createsharedimage(f.depth, fgw, fgh, VK_FORMAT_R32_SFLOAT, GL_R32F) ||
                    !createframebuffer(f.fgfbo, f.mvec, &f.depth)) return false;
                 loopj(numinterp)
-                    if(!createdeviceimage(f.interp[j], w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+                    if(!createdeviceimage(f.interp[j], w, h, outvk, outusage))
                         return false;
             }
             if(!createsharedsemaphore(f.glready) || !createsharedsemaphore(f.vkdone)) return false;
@@ -1074,7 +1331,7 @@ namespace vk
 
         curframe = numframes-1;
         framedone = true;
-        if(dbgvk) conoutf(colourwhite, "Vulkan: screen images %dx%d%s", w, h, fgimages ? tempformatstring(", frame generation inputs %dx%d", fgw, fgh) : "");
+        if(dbgvk) conoutf(colourwhite, "Vulkan: screen images %dx%d%s%s", w, h, wanthdr ? " (HDR)" : "", fgimages ? tempformatstring(", frame generation inputs %dx%d", fgw, fgh) : "");
         return true;
     }
 
@@ -1131,6 +1388,15 @@ namespace vk
             loopv(availlayers) if(!strcmp(availlayers[i].layerName, "VK_LAYER_KHRONOS_validation")) layers.add("VK_LAYER_KHRONOS_validation");
             if(layers.empty()) conoutf(colouryellow, "Vulkan: the validation layer isn't installed");
             if(hasext(avail, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) { addext(exts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME); debugutils = true; }
+        }
+        // HDR10 colour spaces for the swapchain
+        hascolorspace = hasext(avail, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        if(hascolorspace) addext(exts, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        hassurfacemaint = hasext(avail, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) && hasext(avail, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        if(hassurfacemaint)
+        {
+            addext(exts, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+            addext(exts, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
         }
         loopv(exts) if(!hasext(avail, exts[i]))
         {
@@ -1225,7 +1491,11 @@ namespace vk
         }
         vector<const char *> ngxexts;
         ngx_deviceextensions(ngxexts);
-        loopv(ngxexts) if(hasext(avail, ngxexts[i])) addext(exts, ngxexts[i]);
+        loopv(ngxexts) if(hasext(avail, ngxexts[i]))
+        {
+            if(!hassurfacemaint && !strcmp(ngxexts[i], VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) continue;
+            addext(exts, ngxexts[i]);
+        }
         hasrt = hasext(avail, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) && hasext(avail, VK_KHR_RAY_QUERY_EXTENSION_NAME) && hasext(avail, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         haslowlatency = hasext(avail, VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
         haspresentid = hasext(avail, VK_KHR_PRESENT_ID_EXTENSION_NAME);
@@ -1259,6 +1529,8 @@ namespace vk
         if(haspresentid) exts.add(VK_KHR_PRESENT_ID_EXTENSION_NAME);
         if(!haspresentid) haslowlatency = false; // its markers name frames by present id
         if(haslowlatency) exts.add(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+        hashdrmetadata = hasext(avail, VK_EXT_HDR_METADATA_EXTENSION_NAME);
+        if(hashdrmetadata) exts.add(VK_EXT_HDR_METADATA_EXTENSION_NAME);
         if(!f13.synchronization2 || !f12.timelineSemaphore)
         {
             conoutf(colourred, "Vulkan: the device lacks synchronization2 or timeline semaphores");
@@ -1312,6 +1584,7 @@ namespace vk
             latencyvalue = 0;
         }
 
+        SetHdrMetadataEXT = hashdrmetadata ? (PFN_vkSetHdrMetadataEXT)vkGetDeviceProcAddr(device, "vkSetHdrMetadataEXT") : NULL;
         GetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
         GetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR");
         if(!GetMemoryFdKHR || !GetSemaphoreFdKHR) return false;
@@ -1425,6 +1698,7 @@ void vk_shutdown()
         vkrt_shutdown();
         vk_dlssshutdown();
         ngx_shutdown();
+        destroyhdrpipeline();
         if(latencysem) vkDestroySemaphore(device, latencysem, NULL);
         latencysem = VK_NULL_HANDLE;
         haslowlatency = haspresentid = false;
@@ -1446,6 +1720,9 @@ void vk_shutdown()
     instance = VK_NULL_HANDLE;
     physdev = VK_NULL_HANDLE;
     vkactive = false;
+    hdrscreen = swaphdr = swapwanthdr = false;
+    SDL_AtomicSet(&hdrsurface, 0);
+    SetHdrMetadataEXT = NULL;
     gvelocity = 0;
     velvpvalid = false;
     partmotions.setsize(0);
@@ -1513,8 +1790,9 @@ void vk_beginframe()
 
 void vk_capturehudless()
 {
-    if(!vkactive || !fgimages || framedone) return;
+    if(!vkactive || framedone) return;
     screenframe &f = frames[curframe];
+    if(!f.hudlessfbo) return;
     GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
     if(scissor) glDisable(GL_SCISSOR_TEST);
     glBindFramebufferreal(GL_READ_FRAMEBUFFER, screenfbo);
@@ -1757,7 +2035,8 @@ void vk_present()
     framedone = true;
     f.glwait = true;
 
-    if(numgen && !ngx_fgready(f.img.w, f.img.h, f.mvec.w, f.mvec.h)) numgen = 0;
+    bool hdrframe = f.hdr.image != VK_NULL_HANDLE;
+    if(numgen && !ngx_fgready(f.img.w, f.img.h, f.mvec.w, f.mvec.h, hdrframe ? HDRFORMAT : VK_FORMAT_R8G8B8A8_UNORM)) numgen = 0;
 
     vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &f.fence);
@@ -1767,17 +2046,43 @@ void vk_present()
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
     sharedimage *imgs[4] = { &f.img, &f.hudless, &f.mvec, &f.depth };
+    // the HDR conversion reads the frame and its copy without the HUD as storage images
+    VkImageLayout readlayouts[4] = { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    if(hdrframe) readlayouts[0] = readlayouts[1] = VK_IMAGE_LAYOUT_GENERAL;
     loopi(4) if(imgs[i]->image)
-        imagebarrier(cmd, imgs[i]->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        imagebarrier(cmd, imgs[i]->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, readlayouts[i],
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_QUEUE_FAMILY_EXTERNAL, queuefamily);
+    if(hdrframe)
+    {
+        bool hudlesshdr = f.hashudless && numgen && f.hdrhudless.image; // frame generation wants it in HDR too
+        deviceimage *outs[2] = { &f.hdr, hudlesshdr ? &f.hdrhudless : NULL };
+        // the presenting thread's last copy from these images came before
+        loopi(2) if(outs[i]) imagebarrier(cmd, outs[i]->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        float knee, soft;
+        hdrcurve(knee, soft);
+        hdrparams p = {
+            { min(float(hdrpaperwhite), float(hdrpeak)), float(hdrrange), knee, soft },
+            { hdrgamma, f.hashudless ? 1.0f : 0.0f, hudlesshdr ? 1.0f : 0.0f, 0 }
+        };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hdrpipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hdrlayout, 0, 1, &f.hdrset, 0, NULL);
+        vkCmdPushConstants(cmd, hdrlayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+        vkCmdDispatch(cmd, (f.hdr.w + 7)/8, (f.hdr.h + 7)/8, 1);
+        // ready to read, for frame generation and the presenting thread
+        loopi(2) if(outs[i]) imagebarrier(cmd, outs[i]->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
     if(numgen)
     {
         loopi(numgen) imagebarrier(cmd, f.interp[i].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_WRITE_BIT|VK_ACCESS_2_SHADER_READ_BIT);
         fginputs in;
-        in.backbuffer = &f.img;
-        in.hudless = f.hashudless ? &f.hudless : NULL;
+        in.backbuffer = hdrframe ? f.hdr : f.img.device();
+        in.hashudless = f.hashudless;
+        if(f.hashudless) in.hudless = hdrframe ? f.hdrhudless : f.hudless.device();
+        in.hdr = hdrframe;
         in.mvec = &f.mvec;
         in.depth = &f.depth;
         in.interp = f.interp;
@@ -1787,9 +2092,10 @@ void vk_present()
         loopi(numgen) imagebarrier(cmd, f.interp[i].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     }
-    // the inputs go straight back to GL, the screen image after the presenting thread copied it
-    loopi(3) if(imgs[i+1]->image)
-        imagebarrier(cmd, imgs[i+1]->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    // the inputs go straight back to GL, the screen image after the presenting thread copied it, or now when what's
+    // presented is its HDR version
+    loopi(4) if(imgs[i]->image && (i || hdrframe))
+        imagebarrier(cmd, imgs[i]->image, readlayouts[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             queuefamily, VK_QUEUE_FAMILY_EXTERNAL);
     vkEndCommandBuffer(cmd);
@@ -1853,6 +2159,21 @@ void vk_setvsync(int vsync, int tear)
 }
 
 bool vk_hastear() { return hasrelaxed; }
+
+// 1 when the display takes HDR10 (the window's surface offers it), 2 when it's on
+ICOMMANDV(0, hdravailable, vkactive && SDL_AtomicGet(&hdrsurface) ? (hdrscreen ? 2 : 1) : 0);
+
+void vk_updatehdr()
+{
+    bool want = vkactive && hdroutput && SDL_AtomicGet(&hdrsurface);
+    if(want == hdrscreen) return;
+    hdrscreen = want;
+    // the screen images and every buffer the tonemapped frame passes through change format
+    framesdirty = true;
+    cleanupscale(); // the next setup makes the post-processing buffers again
+    vk_dlsscleanupgl();
+    if(dbgvk) conoutf(colourwhite, "Vulkan: HDR output %s", hdrscreen ? "on" : "off");
+}
 
 // 0 off, 1 on, 2 on with the GPU's clocks kept up (Reflex's boost)
 VARF(IDF_PERSIST, lowlatency, 0, 1, 2, { SDL_AtomicSet(&sleepmodedirty, 1); SDL_AtomicSet(&swapdirty, 1); });
@@ -1981,7 +2302,8 @@ ICOMMAND(0, vkgrab, "si", (char *name, int *num),
 ICOMMAND(0, vkinfo, "", (),
 {
     if(!vkactive) { conoutf(colourwhite, "Vulkan: off, GL presents"); return; }
-    conoutf(colourwhite, "Vulkan: %s, swapchain %ux%u %s, screen images %dx%d, ray queries %s, frame generation %s", devprops.deviceName,
+    conoutf(colourwhite, "Vulkan: %s, swapchain %ux%u %s, screen images %dx%d, ray queries %s, frame generation %s, HDR %s", devprops.deviceName,
         swapextent.width, swapextent.height, presentmodename(presentmode), numframes ? frames[0].img.w : 0, numframes ? frames[0].img.h : 0,
-        hasrt ? "on" : "off", fgimages ? tempformatstring("%s%dx (inputs %dx%d, the game could render %.0f fps)", dlssg < 0 ? "auto " : "", (dlssg < 0 ? fglastgen : int(dlssg))+1, frames[0].mvec.w, frames[0].mvec.h, workinterval > 0 ? 1/workinterval : 0.0) : "off");
+        hasrt ? "on" : "off", fgimages ? tempformatstring("%s%dx (inputs %dx%d, the game could render %.0f fps)", dlssg < 0 ? "auto " : "", (dlssg < 0 ? fglastgen : int(dlssg))+1, frames[0].mvec.w, frames[0].mvec.h, workinterval > 0 ? 1/workinterval : 0.0) : "off",
+        swaphdr ? tempformatstring("on (HDR10, peak %.0f nits, paper white %.0f nits)", float(hdrpeak), float(hdrpaperwhite)) : (SDL_AtomicGet(&hdrsurface) ? "off" : "not offered by the display"));
 });

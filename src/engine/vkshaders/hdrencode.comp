@@ -1,0 +1,61 @@
+// HDR output (vk.cpp): the finished frame, tonemapped for SDR, goes to HDR10. The engine's tonemap maps the scene's
+// light k to 1 - 2^-k, so each pixel's light is taken back through that and mapped again by a curve that starts the
+// same but reaches the display's peak instead of white: shadows and midtones stay as they were, highlights get their
+// range back. The frame comes in 16 bits, so the brightest values still tell their light apart. The HUD, found where
+// the frame differs from its copy without it, stays at paper white, and so does everything without that copy (menus).
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16) uniform readonly image2D sdrframe;
+layout(set = 0, binding = 1, rgba16) uniform readonly image2D sdrhudless;
+layout(set = 0, binding = 2, rgb10_a2) uniform writeonly image2D hdrframe;
+layout(set = 0, binding = 3, rgb10_a2) uniform writeonly image2D hdrhudless;
+
+layout(push_constant) uniform Params
+{
+    vec4 curve; // x paper white in nits, y the light that reaches the peak, z the knee, w the curve's softness above it
+    vec4 flags; // x the tonemap's gamma, y 1 with the frame without the HUD, z 1 to make that HDR too
+} pc;
+
+vec3 tonits(vec3 sdr, float hud)
+{
+    vec3 shown = pow(sdr, vec3(2.2)); // how it looked on an SDR display
+    vec3 light = pow(sdr, vec3(pc.flags.x)); // the tonemap's own output
+    float t = dot(light, vec3(0.2126, 0.7152, 0.0722)), knee = pc.curve.z;
+    // below the knee the picture is as it was; above it the curve leaves the knee as steeply as the tonemap did and
+    // reaches the peak (in paper whites) at the brightest light the frame can hold
+    float gain = 1.0;
+    if(t > knee)
+    {
+        float k = -log2(max(1.0 - t, exp2(-pc.curve.y))), kknee = -log2(1.0 - knee), soft = pc.curve.w;
+        gain = (knee + soft*(1.0 - knee)*(1.0 - exp2(-(k - kknee)/soft)))/t;
+    }
+    return shown*mix(gain, 1.0, hud)*pc.curve.x;
+}
+
+vec3 pq(vec3 nits)
+{
+    // Rec.709 primaries to Rec.2020, then the ST.2084 curve over 10000 nits
+    const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
+    vec3 c = clamp(to2020*nits/10000.0, 0.0, 1.0);
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    vec3 p = pow(c, vec3(m1));
+    return pow((c1 + c2*p)/(1.0 + c3*p), vec3(m2));
+}
+
+void main()
+{
+    ivec2 size = imageSize(sdrframe);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+    vec3 frame = imageLoad(sdrframe, p).rgb;
+    float hud = 1.0;
+    if(pc.flags.y > 0.0)
+    {
+        vec3 hudless = imageLoad(sdrhudless, p).rgb, diff = abs(frame - hudless);
+        hud = clamp(max(diff.r, max(diff.g, diff.b))*16.0, 0.0, 1.0);
+        if(pc.flags.z > 0.0) imageStore(hdrhudless, p, vec4(pq(tonits(hudless, 0.0)), 1.0));
+    }
+    imageStore(hdrframe, p, vec4(pq(tonits(frame, hud)), 1.0));
+}
