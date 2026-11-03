@@ -1378,6 +1378,7 @@ bool VisorSurface::render(int w, int h, GLenum f, GLenum t, int count)
         }
         
         hudquad(0, 0, vieww, viewh, 0, buffers[BLIT]->height, buffers[BLIT]->width, -buffers[BLIT]->height);
+        if(!noview) vk_capturehudless(); // the scene as shown, before the HUD goes over it
 
         setcompositedblend(true); // HUD buffer contains composited content
 

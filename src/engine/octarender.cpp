@@ -1797,6 +1797,7 @@ void findtjoints()
 
 void octarender()                               // creates va s for all leaf cubes that don't already have them
 {
+    vkrt_worldchanged(); // the ray traced copy of the world follows
     int csi = 0;
     while(1<<csi < worldsize) csi++;
 

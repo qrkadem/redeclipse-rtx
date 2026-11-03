@@ -272,6 +272,13 @@ else
     else
         CLIENT_INCLUDES = $(INCLUDES) `$(PKG_CONFIG) --cflags x11 sdl2 SDL2_image openal sndfile zlib gl`
         CLIENT_LIBS = -Lenet -lenet `$(PKG_CONFIG) --libs x11 sdl2 SDL2_image openal sndfile zlib gl`
+        # Vulkan presenting (engine/vk.cpp) with the bundled headers, and DLSS when the NGX SDK was fetched (ngx/fetch.sh)
+        override CLIENT_INCLUDES += -Ivulkan/include
+        override CLIENT_LIBS += -lvulkan
+        ifneq (,$(wildcard ngx/lib/libnvsdk_ngx.a))
+            override CLIENT_INCLUDES += -Ingx/include -DHAVE_NGX
+            override CLIENT_LIBS += ngx/lib/libnvsdk_ngx.a -ldl
+        endif
     endif
 
     ifneq (,$(WANT_STEAM))
@@ -317,6 +324,7 @@ CLIENT_OBJS = \
     engine/irc.o \
     engine/light.o \
     engine/main.o \
+    engine/ngx.o \
     engine/master.o \
     engine/material.o \
     engine/mcube.o \
@@ -343,6 +351,8 @@ CLIENT_OBJS = \
     engine/stain.o \
     engine/texture.o \
     engine/ui.o \
+    engine/vk.o \
+    engine/vkrt.o \
     engine/water.o \
     engine/world.o \
     engine/worldio.o \
@@ -1158,4 +1168,12 @@ engine/engine.h.gch: shared/glexts.h shared/glemu.h shared/iengine.h
 engine/engine.h.gch: shared/igame.h engine/http.h engine/irc.h engine/world.h
 engine/engine.h.gch: engine/octa.h engine/light.h engine/texture.h
 engine/engine.h.gch: engine/bih.h engine/model.h engine/sound.h
-engine/engine.h.gch: engine/soundenvprop.h
+engine/engine.h.gch: engine/soundenvprop.h engine/vk.h
+
+engine/vk.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h
+engine/ngx.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h
+engine/vkrt.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h engine/vkshaders/rttrace.spv.h engine/vkshaders/rtfilter.spv.h
+
+# Vulkan compute shaders, built into headers holding their SPIR-V
+engine/vkshaders/%.spv.h: engine/vkshaders/%.comp
+	glslc --target-env=vulkan1.3 -O -mfmt=c -o $@ $<

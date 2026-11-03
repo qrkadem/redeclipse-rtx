@@ -1037,6 +1037,7 @@ ICOMMAND(0, gettimer, "bbb", (int *timenum, int *prop, int *idx), gettimers(*tim
 
 void gl_resize()
 {
+    vk_resize(renderw, renderh);
     gl_setupframe();
     glViewport(0, 0, hudw, hudh);
 }
@@ -2326,6 +2327,7 @@ void gl_drawview()
     {
         renderavatar();
         GLERROR;
+        vkrt_trace(); // the G-buffer is complete, lighting reads what the rays found
     }
 
     glFlush();
@@ -2495,6 +2497,7 @@ void gl_drawhud(bool noview = false)
 
 void gl_drawnoview()
 {
+    vk_beginframe();
     gl_setupframe();
     hud::update(hudw, hudh);
     gl_drawhud(true);
@@ -2502,6 +2505,7 @@ void gl_drawnoview()
 
 void gl_drawframe()
 {
+    vk_beginframe();
     bool noview = hasnoview();
     synctimers();
 
@@ -2509,7 +2513,11 @@ void gl_drawframe()
     hud::update(hudw, hudh);
 
     farplane = worldsize*farplanescale;
-    if(!noview) gl_drawview();
+    if(!noview)
+    {
+        gl_drawview();
+        vk_capturefg();
+    }
     gl_drawhud(noview);
 
     if(frametimer)

@@ -1,0 +1,48 @@
+// Spatial filter of the accumulated ray traced terms, over neighbours on the same surface
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D accum;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D positions;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D normals;
+layout(set = 0, binding = 3, rg16f) uniform writeonly image2D result;
+
+layout(push_constant) uniform Params
+{
+    vec4 campos; // xyz camera
+    vec4 params; // x radius in pixels
+} pc;
+
+void main()
+{
+    ivec2 size = imageSize(positions);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p);
+    if(wp.w <= 0.0)
+    {
+        imageStore(result, p, vec4(1.0));
+        return;
+    }
+    vec3 n = normalize(imageLoad(normals, p).xyz);
+    float dist = distance(wp.xyz, pc.campos.xyz), planescale = 1.0/(0.01*dist + 0.1);
+    vec4 centre = imageLoad(accum, p);
+    // fewer filtered samples where the history is long already
+    int radius = centre.w >= 8.0 ? 1 : int(pc.params.x);
+    vec2 sum = vec2(0.0);
+    float total = 0.0;
+    for(int y = -radius; y <= radius; y++) for(int x = -radius; x <= radius; x++)
+    {
+        ivec2 q = clamp(p + ivec2(x, y)*2, ivec2(0), size - 1);
+        vec4 qp = imageLoad(positions, q);
+        if(qp.w <= 0.0) continue;
+        vec3 qn = normalize(imageLoad(normals, q).xyz);
+        float w = pow(max(dot(n, qn), 0.0), 16.0) * exp(-abs(dot(qp.xyz - wp.xyz, n))*planescale) * exp(-0.5*float(x*x + y*y)/float(radius*radius + 1));
+        vec4 a = imageLoad(accum, q);
+        sum += a.xy * w;
+        total += w;
+    }
+    imageStore(result, p, vec4(total > 0.0 ? sum/total : centre.xy, 0.0, 0.0));
+}

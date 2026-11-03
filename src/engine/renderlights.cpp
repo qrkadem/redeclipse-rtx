@@ -258,6 +258,10 @@ GETVARMPV(ao, sunmin, float);
 GETVARMPV(ao, sharp, float);
 
 VARF(IDF_PERSIST, ao, 0, 1, 1, { cleanupao(); cleardeferredlightshaders(); });
+
+// ambient occlusion reaches the lighting from SSAO or from ray tracing (vkrt.cpp), which takes over when on
+static inline bool aoon() { return ao || vkrt_aoavailable(); }
+static inline GLuint aotexture() { return vkrt_active() || !ao ? vkrt_texture() : (aotex[2] ? aotex[2] : aotex[0]); }
 FVAR(0, aocutoff, 0, 2.0f, 1e3f);
 FVAR(0, aoprefilterdepth, 0, 1, 1e3f);
 VAR(IDF_PERSIST, aoblur, 0, 4, MAXBLURRADIUS);
@@ -295,7 +299,7 @@ void viewao()
 
 void renderao()
 {
-    if(!ao) return;
+    if(!ao || vkrt_aoavailable()) return;
 
     timer *aotimer = begintimer("Ambient Obscurance");
 
@@ -2819,7 +2823,8 @@ Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
         sun[sunlen++] = '0' + csmsplits;
         if(!minimap)
         {
-            if(avatar && ao && getaosun()) sun[sunlen++] = 'A';
+            if(avatar && aoon() && getaosun()) sun[sunlen++] = 'A';
+            if(vkrt_sunavailable()) sun[sunlen++] = 'T';
             if(!nogi && gi && getgiscale() && getgidist())
             {
                 userh = rhsplits;
@@ -2830,7 +2835,7 @@ Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
     }
     if(!minimap)
     {
-        if(avatar && ao) sun[sunlen++] = 'a';
+        if(avatar && aoon()) sun[sunlen++] = 'a';
         if(lighttilebatch && (!usecsm || batchsunlight > (userh ? 1 : 0))) sun[sunlen++] = 'b';
     }
     sun[sunlen] = '\0';
@@ -3086,10 +3091,10 @@ static void bindlighttexs(int msaapass = 0, bool transparent = false)
     glActiveTexture_(GL_TEXTURE4);
     glBindTexture(shadowatlastarget, shadowatlastex);
     if(usesmcomparemode()) setsmcomparemode(); else setsmnoncomparemode();
-    if(ao)
+    if(aoon() || vkrt_sunavailable())
     {
         glActiveTexture_(GL_TEXTURE5);
-        glBindTexture(GL_TEXTURE_RECTANGLE, aotex[2] ? aotex[2] : aotex[0]);
+        glBindTexture(GL_TEXTURE_RECTANGLE, aotexture());
     }
     if(drawradiancehints()) loopi(4)
     {
@@ -3109,17 +3114,18 @@ static void bindlighttexs(int msaapass = 0, bool transparent = false)
 static inline void setlightglobals(bool transparent = false)
 {
     GLOBALPARAMF(shadowatlasscale, 1.0f/shadowatlaspacker.w, 1.0f/shadowatlaspacker.h);
-    if(ao)
+    if(aoon() || vkrt_sunavailable())
     {
-        if(transparent || !(DRAWTEX_VIEW&(1<<drawtex)) || (!drawtex && editmode && fullbright))
+        if(transparent || !(DRAWTEX_VIEW&(1<<drawtex)) || (!drawtex && editmode && fullbright) || !(ao || vkrt_active()))
         {
             GLOBALPARAMF(aoscale, 0.0f, 0.0f);
             GLOBALPARAMF(aoparams, 1.0f, 0.0f, 1.0f, 0.0f);
         }
         else
         {
-            GLOBALPARAM(aoscale, aotex[2] ? vec2(1, 1) : vec2(float(aow)/vieww, float(aoh)/viewh));
-            GLOBALPARAMF(aoparams, getaomin(), 1.0f-getaomin(), getaosunmin(), 1.0f-getaosunmin());
+            GLOBALPARAM(aoscale, vkrt_active() || aotex[2] ? vec2(1, 1) : vec2(float(aow)/vieww, float(aoh)/viewh));
+            if(vkrt_active() && !vkrt_aoavailable()) GLOBALPARAMF(aoparams, 1.0f, 0.0f, 1.0f, 0.0f); // only the sun is traced
+            else GLOBALPARAMF(aoparams, getaomin(), 1.0f-getaomin(), getaosunmin(), 1.0f-getaosunmin());
         }
     }
     float lightscale = 2.0f*ldrscaleb;
@@ -5346,6 +5352,7 @@ void setupscreenparams()
     GLOBALPARAMF(gdepthpackparams, -1.0f/farplane, -255.0f/farplane, -(255.0f*255.0f)/farplane);
     GLOBALPARAMF(gdepthunpackparams, -farplane, -farplane/255.0f, -farplane/(255.0f*255.0f));
     GLOBALPARAM(worldmatrix, worldmatrix);
+    if(!drawtex) vk_snapshotview(); // frame generation works from the main view's matrices, later passes change them
 
     GLOBALPARAMF(ldrscale, ldrscale);
     GLOBALPARAMF(hdrgamma, hdrgamma, 1.0f/hdrgamma);
@@ -5599,10 +5606,10 @@ void renderreflections()
     }
     glActiveTexture_(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
-    if(ao)
+    if(aoon())
     {
         glActiveTexture_(GL_TEXTURE5);
-        glBindTexture(GL_TEXTURE_RECTANGLE, aotex[2] ? aotex[2] : aotex[0]);
+        glBindTexture(GL_TEXTURE_RECTANGLE, aotexture());
     }
     if(reflprobes) loopi(4)
     {
@@ -5623,7 +5630,7 @@ void renderreflections()
 
     string opts;
     int optslen = 0;
-    if(ao) opts[optslen++] = 'a';
+    if(aoon()) opts[optslen++] = 'a';
     if(reflssr) opts[optslen++] = 's';
     if(reflprobes) opts[optslen++] = 'p';
     opts[optslen] = '\0';

@@ -113,3 +113,7 @@ doc/research/
 .scratch/
 .out-of-scope/
 learning-records/
+
+# NVIDIA NGX (DLSS) runtime libraries, fetched by src/ngx/fetch.sh
+libnvidia-ngx-*.so.*
+src/engine/vkshaders/*.spv.h

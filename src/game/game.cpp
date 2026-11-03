@@ -4216,6 +4216,8 @@ namespace game
         nexttype = -1;
     }
 
+    FVAR(0, spinyaw, -3600, 0, 3600); // development aid: turns an editing or spectating player this many degrees a second
+
     void updateworld() // main game update loop
     {
         if(connected())
@@ -4244,6 +4246,7 @@ namespace game
             }
 
             checklights();
+            if(spinyaw && (player1->state == CS_EDITING || player1->state == CS_SPECTATOR)) player1->yaw += spinyaw*curtime/1000.0f;
             player1->conopen = hud::hasinput(true);
             checkoften(player1, true);
             loopv(players) if(players[i]) checkoften(players[i], players[i]->ai != NULL);

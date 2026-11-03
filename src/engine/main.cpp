@@ -199,6 +199,8 @@ void cleanup()
     #ifdef __APPLE__
         if(screen) SDL_SetWindowFullscreen(screen, 0);
     #endif
+    if(vkactive) vk_cleanupgl();
+    vk_shutdown();
     SDL_Quit();
 }
 
@@ -313,10 +315,16 @@ int getdisplaymode()
     return index;
 }
 
+static void getdrawablesize(int &w, int &h)
+{
+    if(vkactive) vk_getdrawablesize(w, h);
+    else SDL_GL_GetDrawableSize(screen, &w, &h);
+}
+
 void setupdisplay(bool dogl = true, bool msg = true)
 {
     SDL_GetWindowSize(screen, &screenw, &screenh);
-    SDL_GL_GetDrawableSize(screen, &renderw, &renderh);
+    getdrawablesize(renderw, renderh);
 
     int index = getdisplaymode();
     int winflags = SDL_GetWindowFlags(screen);
@@ -328,7 +336,7 @@ void setupdisplay(bool dogl = true, bool msg = true)
         scr_h = clamp(display.h, SCR_MINH, SCR_MAXH);
         resetfullscreen();
         SDL_GetWindowSize(screen, &screenw, &screenh);
-        SDL_GL_GetDrawableSize(screen, &renderw, &renderh);
+        getdrawablesize(renderw, renderh);
     }
     scr_w = screenw;
     scr_h = screenh;
@@ -463,6 +471,13 @@ void restorevsync()
 {
     if(initing || !glcontext) return;
     extern int vsync, vsynctear;
+    if(vkactive)
+    {
+        vk_setvsync(vsync, vsynctear);
+        hasvsynctear = vk_hastear() ? 1 : 0;
+        curvsync = vsync;
+        return;
+    }
     int err = 0;
 
     if(hasvsynctear < 0 || (vsync && vsynctear))
@@ -482,13 +497,18 @@ void restorevsync()
 VARF(IDF_PERSIST, vsync, 0, 0, 1, restorevsync());
 VARF(IDF_PERSIST, vsynctear, 0, 1, 1, { if(vsync) restorevsync(); });
 
+static bool vkfailed = false; // Vulkan presenting failed this run, so GL presents
+
 void setupscreen(bool dogl = true)
 {
+    if(vkactive) vk_cleanupgl();
     if(glcontext)
     {
         SDL_GL_DeleteContext(glcontext);
         glcontext = NULL;
     }
+    vk_destroyglwindow();
+    vk_shutdown();
     if(screen)
     {
         SDL_DestroyWindow(screen);
@@ -533,7 +553,16 @@ void setupscreen(bool dogl = true)
 #endif
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
-    screen = SDL_CreateWindow(caption, winx, winy, winw, winh, flags);
+    // with Vulkan presenting, the window is a Vulkan one and the GL context lives on a hidden window
+    bool usevk = vulkan && !vkfailed;
+    screen = usevk ? vk_createwindow(caption, winx, winy, winw, winh, flags) : SDL_CreateWindow(caption, winx, winy, winw, winh, flags);
+    if(!screen && usevk)
+    {
+        conoutf(colouryellow, "Vulkan: no Vulkan window (%s), GL presents instead", SDL_GetError());
+        vkfailed = true;
+        usevk = false;
+        screen = SDL_CreateWindow(caption, winx, winy, winw, winh, flags);
+    }
     if(!screen) fatal("Failed to create OpenGL window: %s", SDL_GetError());
     SDL_Surface *s = loadsurface("textures/icon");
     if(s)
@@ -550,13 +579,26 @@ void setupscreen(bool dogl = true)
 #else
     static const int glversions[] = { 40, 33, 32, 31 };
 #endif
-    loopi(sizeof(glversions)/sizeof(glversions[0]))
+    SDL_Window *glwindow = usevk ? vk_createglwindow() : screen;
+    if(glwindow) loopi(sizeof(glversions)/sizeof(glversions[0]))
     {
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, glversions[i] / 10);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, glversions[i] % 10);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, glversions[i] >= 32 ? SDL_GL_CONTEXT_PROFILE_CORE : 0);
-        glcontext = SDL_GL_CreateContext(screen);
+        glcontext = SDL_GL_CreateContext(glwindow);
         if(glcontext) break;
+    }
+    if(usevk && (!glcontext || !vk_init()))
+    {
+        conoutf(colouryellow, "Vulkan: presenting through GL instead");
+        if(glcontext) SDL_GL_DeleteContext(glcontext);
+        glcontext = NULL;
+        vk_destroyglwindow();
+        SDL_DestroyWindow(screen);
+        screen = NULL;
+        vkfailed = true;
+        setupscreen(dogl);
+        return;
     }
     if(!glcontext) fatal("Failed to create an OpenGL 3.1 or greater context: %s", SDL_GetError());
     setupdisplay(dogl, engineready);
@@ -962,7 +1004,8 @@ void swapbuffers(bool overlay)
 {
     recorder::capture(overlay);
     gle::disable();
-    SDL_GL_SwapWindow(screen);
+    if(vkactive) vk_present();
+    else SDL_GL_SwapWindow(screen);
 }
 
 int frameloops = 0;

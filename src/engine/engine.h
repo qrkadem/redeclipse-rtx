@@ -128,6 +128,7 @@ extern void shutdownsignal(int signum);
 #include "texture.h"
 #include "bih.h"
 #include "model.h"
+#include "vk.h"
 
 extern physent *camera1, camera;
 extern mapz hdr;

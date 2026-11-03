@@ -1,0 +1,120 @@
+// Ray traced ambient occlusion and sun shadow, one frame's samples blended into the history of the same surface
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D positions; // world position, w 0 where nothing was drawn
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D normals;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D history;   // ao, sun, distance to the camera, samples
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D accum;
+
+layout(push_constant) uniform Params
+{
+    mat4 prevclip;   // world to last frame's clip space
+    vec4 campos;     // xyz camera, w frame number
+    vec4 prevcampos; // xyz last frame's camera
+    vec4 sun;        // xyz towards the sun, w the sun's radius as a tangent, 0 without sun
+    vec4 params;     // x ao radius, y most frames kept, z ao rays, w 1 ao | 2 sun
+} pc;
+
+uint hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float rnd(inout uint seed)
+{
+    seed = hash(seed);
+    return float(seed) * (1.0/4294967296.0);
+}
+
+bool occluded(vec3 o, vec3 d, float tmax)
+{
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF, o, 0.0, d, tmax);
+    while(rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+void basis(vec3 n, out vec3 t, out vec3 b)
+{
+    t = normalize(abs(n.z) < 0.999 ? cross(n, vec3(0.0, 0.0, 1.0)) : cross(n, vec3(1.0, 0.0, 0.0)));
+    b = cross(n, t);
+}
+
+void main()
+{
+    ivec2 size = imageSize(positions);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p);
+    if(wp.w <= 0.0)
+    {
+        imageStore(accum, p, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
+    vec3 n = normalize(imageLoad(normals, p).xyz);
+    float dist = distance(wp.xyz, pc.campos.xyz);
+    vec3 o = wp.xyz + n*(0.05 + dist*0.001); // off the surface, more further away where depth is coarser
+    uint seed = hash(uint(p.x) | (uint(p.y) << 16)) ^ hash(floatBitsToUint(pc.campos.w));
+    int flags = int(pc.params.w);
+
+    float ao = 1.0;
+    if((flags & 1) != 0)
+    {
+        vec3 t, b;
+        basis(n, t, b);
+        int rays = int(pc.params.z);
+        float hits = 0.0;
+        for(int i = 0; i < rays; i++)
+        {
+            // cosine weighted over the hemisphere
+            float r1 = rnd(seed), r2 = rnd(seed), r = sqrt(r1), phi = 6.28318531*r2;
+            vec3 d = normalize(t*(r*cos(phi)) + b*(r*sin(phi)) + n*sqrt(max(1.0 - r1, 0.0)));
+            if(occluded(o, d, pc.params.x)) hits += 1.0;
+        }
+        ao = 1.0 - hits/float(rays);
+    }
+
+    float sun = 1.0;
+    if((flags & 2) != 0 && pc.sun.w >= 0.0)
+    {
+        if(dot(n, pc.sun.xyz) <= 0.0) sun = 0.0;
+        else
+        {
+            // a point on the sun's disc, for soft edges
+            vec3 t, b;
+            basis(pc.sun.xyz, t, b);
+            float r = sqrt(rnd(seed))*pc.sun.w, phi = 6.28318531*rnd(seed);
+            vec3 d = normalize(pc.sun.xyz + t*(r*cos(phi)) + b*(r*sin(phi)));
+            sun = occluded(o, d, 1.0e6) ? 0.0 : 1.0;
+        }
+    }
+
+    // where this surface was last frame: its history counts if the distance to the camera matches
+    vec4 result = vec4(ao, sun, dist, 1.0);
+    vec4 prev = pc.prevclip * vec4(wp.xyz, 1.0);
+    if(prev.w > 0.0)
+    {
+        vec2 prevpixel = (prev.xy/prev.w*0.5 + 0.5)*vec2(size);
+        ivec2 pp = ivec2(floor(prevpixel));
+        if(pp.x >= 0 && pp.y >= 0 && pp.x < size.x && pp.y < size.y)
+        {
+            vec4 h = imageLoad(history, pp);
+            float prevdist = distance(wp.xyz, pc.prevcampos.xyz);
+            if(h.w > 0.0 && abs(h.z - prevdist) < 0.02*prevdist + 0.25)
+            {
+                float count = min(h.w + 1.0, pc.params.y);
+                result.xy = mix(h.xy, result.xy, 1.0/count);
+                result.w = count;
+            }
+        }
+    }
+    imageStore(accum, p, result);
+}
