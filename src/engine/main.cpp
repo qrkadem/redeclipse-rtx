@@ -1558,12 +1558,14 @@ int main(int argc, char **argv)
             if(wantdisplaysetup) setupdisplay();
             curtextscale = textscale;
 
+            vk_latencysleep(); // before the frame's time and input are taken
             int elapsed = updatetimer(true);
             updatefps(frameloops, elapsed);
 
             cdpi::runframe();
             UI::poke();
             checkinput();
+            vk_latencymark(6); // input sampled
             tryedit();
 
             checksleep(lastmillis);
@@ -1594,6 +1596,7 @@ int main(int argc, char **argv)
                 updateparticles();
                 updatesounds();
 
+                vk_latencymark(1); // simulation done
                 if(!minimized || renderunfocused)
                 {
                     inbetweenframes = renderedframe = false;

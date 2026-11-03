@@ -2507,6 +2507,7 @@ void gl_drawnoview()
 
 void gl_drawframe()
 {
+    vk_latencymark(2); // render submission starts
     vk_beginframe();
     bool noview = hasnoview();
     synctimers();

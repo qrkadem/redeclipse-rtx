@@ -14,7 +14,7 @@ VAR(IDF_INIT, vkvalidation, 0, 0, 1); // Khronos validation layer, for developme
 VAR(0, dbgvk, 0, 0, 1);
 
 bool vkactive = false;
-extern int dlssg, refreshrate;
+extern int dlssg, refreshrate, lowlatency;
 VAR(0, gvelocity, 1, 0, 0); // the G-buffer has a velocity target that models write their motion into, see model.cfg
 
 #define MAXVKFRAMES 2 // screen images GL and Vulkan take turns with
@@ -260,13 +260,23 @@ namespace vk
     void lockqueue() { if(queuelock) SDL_LockMutex(queuelock); }
     void unlockqueue() { if(queuelock) SDL_UnlockMutex(queuelock); }
 
-    VkResult submit(const VkSubmitInfo2 &si, VkFence fence)
+    static bool haslowlatency = false, haspresentid = false;
+    static uint64_t latencyframe = 0;
+
+    // frameid tags the work with the frame's latency id, so the driver knows how long each frame keeps the GPU busy
+    VkResult submit(const VkSubmitInfo2 &si, VkFence fence, uint64_t frameid)
     {
+        VkSubmitInfo2 tagged = si;
+        VkLatencySubmissionPresentIdNV lid = { VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV };
+        lid.presentID = frameid;
+        if(frameid && haslowlatency && !si.pNext) tagged.pNext = &lid;
         lockqueue();
-        VkResult r = vkQueueSubmit2(vk::queue, 1, &si, fence);
+        VkResult r = vkQueueSubmit2(vk::queue, 1, &tagged, fence);
         unlockqueue();
         return r;
     }
+
+    uint64_t currentframeid() { return latencyframe; }
 
     void queueidle()
     {
@@ -385,6 +395,17 @@ namespace vk
     static uint64_t evalcounter = 0;
 
     static VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+
+    // low latency (VK_NV_low_latency2, what NVIDIA Reflex is on Vulkan): the main thread sleeps before taking input
+    // for as long as the frame would otherwise wait in a queue, and marks where the frame's work starts and ends
+    static PFN_vkSetLatencySleepModeNV SetLatencySleepModeNV = NULL;
+    static PFN_vkLatencySleepNV LatencySleepNV = NULL;
+    static PFN_vkSetLatencyMarkerNV SetLatencyMarkerNV = NULL;
+    static PFN_vkGetLatencyTimingsNV GetLatencyTimingsNV = NULL;
+    static VkSemaphore latencysem = VK_NULL_HANDLE;
+    static uint64_t latencyvalue = 0;
+    static SDL_mutex *swaplock = NULL; // the main thread uses the swapchain for latency, the presenting thread replaces it
+    static SDL_atomic_t sleepmodedirty;
     static VkFormat swapformat = VK_FORMAT_UNDEFINED;
     static VkExtent2D swapextent = { 0, 0 };
     static VkPresentModeKHR presentmode = VK_PRESENT_MODE_FIFO_KHR;
@@ -414,6 +435,20 @@ namespace vk
     }
 
     static double seconds() { return double(SDL_GetPerformanceCounter())/double(SDL_GetPerformanceFrequency()); }
+
+    static void latencymarker(VkLatencyMarkerNV marker, uint64_t frameid)
+    {
+        if(!haslowlatency) return; // marked even with the sleep off, so the driver's timings compare
+        SDL_LockMutex(swaplock);
+        if(swapchain)
+        {
+            VkSetLatencyMarkerInfoNV mi = { VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV };
+            mi.presentID = frameid;
+            mi.marker = marker;
+            SetLatencyMarkerNV(device, swapchain, &mi);
+        }
+        SDL_UnlockMutex(swaplock);
+    }
 
     static void sleepuntil(double t)
     {
@@ -500,7 +535,9 @@ namespace vk
             conoutf(colourred, "Vulkan: the swapchain can't be copied into");
             return false;
         }
-        uint32_t count = max(caps.minImageCount + 1, 3u);
+        // with vsync every image beyond the one shown and the one being drawn is a frame of latency, so low latency keeps
+        // the fewest the surface allows
+        uint32_t count = mode != VK_PRESENT_MODE_IMMEDIATE_KHR && mode != VK_PRESENT_MODE_MAILBOX_KHR && lowlatency ? max(caps.minImageCount, 2u) : max(caps.minImageCount + 1, 3u);
         if(caps.maxImageCount) count = min(count, caps.maxImageCount);
         VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         if(!(caps.supportedCompositeAlpha&alpha)) loopi(4) if(caps.supportedCompositeAlpha&(1<<i)) { alpha = VkCompositeAlphaFlagBitsKHR(1<<i); break; }
@@ -520,10 +557,16 @@ namespace vk
         sci.presentMode = mode;
         sci.clipped = VK_TRUE;
         sci.oldSwapchain = swapchain;
+        VkSwapchainLatencyCreateInfoNV lci = { VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV };
+        lci.latencyModeEnable = VK_TRUE;
+        if(haslowlatency) sci.pNext = &lci;
         VkSwapchainKHR newswapchain = VK_NULL_HANDLE;
         VKCHECK(vkCreateSwapchainKHR(device, &sci, NULL, &newswapchain));
+        if(swaplock) SDL_LockMutex(swaplock);
         destroyswapchain();
         swapchain = newswapchain;
+        if(swaplock) SDL_UnlockMutex(swaplock);
+        SDL_AtomicSet(&sleepmodedirty, 1); // a new swapchain starts without its latency mode
         swapformat = format.format;
         swapextent = extent;
         presentmode = mode;
@@ -543,7 +586,7 @@ namespace vk
     struct presentjob
     {
         int slot, numgen;
-        uint64_t evalvalue;
+        uint64_t evalvalue, frameid;
         double interval;
     };
     #define PRESENTRING 8
@@ -670,7 +713,9 @@ namespace vk
 
     // copies src (GL oriented, in TRANSFER_SRC layout unless real) into the next swapchain image and presents it;
     // for the rendered image it also hands the frame's images back to GL
-    static void presentimage(VkImage src, int srcw, int srch, screenframe *real)
+    static void latencymarker(VkLatencyMarkerNV marker, uint64_t frameid);
+
+    static void presentimage(VkImage src, int srcw, int srch, screenframe *real, uint64_t frameid = 0)
     {
         presentcmd &p = presentcmds[presentnext];
         presentnext = (presentnext+1)%PRESENTRING;
@@ -763,6 +808,9 @@ namespace vk
         si.pCommandBufferInfos = &cbi;
         si.signalSemaphoreInfoCount = numsignals;
         si.pSignalSemaphoreInfos = signals;
+        VkLatencySubmissionPresentIdNV lid = { VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV };
+        lid.presentID = frameid;
+        if(real && frameid && haslowlatency) si.pNext = &lid;
         lockqueue();
         VkResult r = vkQueueSubmit2(vk::queue, 1, &si, p.fence);
         if(r == VK_SUCCESS && index != UINT32_MAX)
@@ -773,7 +821,14 @@ namespace vk
             pi.swapchainCount = 1;
             pi.pSwapchains = &swapchain;
             pi.pImageIndices = &index;
+            // the rendered frame's present carries the id its latency markers use
+            VkPresentIdKHR pid = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+            pid.swapchainCount = 1;
+            pid.pPresentIds = &frameid;
+            if(real && frameid && haspresentid) pi.pNext = &pid;
+            if(real && frameid) latencymarker(VK_LATENCY_MARKER_PRESENT_START_NV, frameid);
             VkResult pr = vkQueuePresentKHR(vk::queue, &pi);
+            if(real && frameid) latencymarker(VK_LATENCY_MARKER_PRESENT_END_NV, frameid);
             if(pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) SDL_AtomicSet(&swapdirty, 1);
         }
         unlockqueue();
@@ -819,7 +874,7 @@ namespace vk
                 presentimage(f.interp[i].image, f.interp[i].w, f.interp[i].h, NULL);
             }
             if(job.numgen) sleepuntil(start + job.numgen*step);
-            presentimage(f.img.image, f.img.w, f.img.h, &f);
+            presentimage(f.img.image, f.img.w, f.img.h, &f, job.frameid);
 
             SDL_LockMutex(presentlock);
             slotbusy[job.slot] = false;
@@ -1172,6 +1227,9 @@ namespace vk
         ngx_deviceextensions(ngxexts);
         loopv(ngxexts) if(hasext(avail, ngxexts[i])) addext(exts, ngxexts[i]);
         hasrt = hasext(avail, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) && hasext(avail, VK_KHR_RAY_QUERY_EXTENSION_NAME) && hasext(avail, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        haslowlatency = hasext(avail, VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+        haspresentid = hasext(avail, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        VkPhysicalDevicePresentIdFeaturesKHR pidfeats = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
 
         VkPhysicalDeviceAccelerationStructureFeaturesKHR asfeats = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
         VkPhysicalDeviceRayQueryFeaturesKHR rqfeats = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
@@ -1187,7 +1245,20 @@ namespace vk
             f13.pNext = &asfeats;
             asfeats.pNext = &rqfeats;
         }
+        if(haspresentid)
+        {
+            pidfeats.pNext = feats.pNext;
+            feats.pNext = &pidfeats;
+        }
         vkGetPhysicalDeviceFeatures2(physdev, &feats);
+        if(haspresentid && !pidfeats.presentId)
+        {
+            haspresentid = false;
+            feats.pNext = pidfeats.pNext;
+        }
+        if(haspresentid) exts.add(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        if(!haspresentid) haslowlatency = false; // its markers name frames by present id
+        if(haslowlatency) exts.add(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
         if(!f13.synchronization2 || !f12.timelineSemaphore)
         {
             conoutf(colourred, "Vulkan: the device lacks synchronization2 or timeline semaphores");
@@ -1225,6 +1296,21 @@ namespace vk
         VKCHECK(vkCreateDevice(physdev, &dci, NULL, &device));
         vkGetDeviceQueue(device, queuefamily, 0, &vk::queue);
         vkGetPhysicalDeviceMemoryProperties(physdev, &memprops);
+
+        if(haslowlatency)
+        {
+            SetLatencySleepModeNV = (PFN_vkSetLatencySleepModeNV)vkGetDeviceProcAddr(device, "vkSetLatencySleepModeNV");
+            LatencySleepNV = (PFN_vkLatencySleepNV)vkGetDeviceProcAddr(device, "vkLatencySleepNV");
+            SetLatencyMarkerNV = (PFN_vkSetLatencyMarkerNV)vkGetDeviceProcAddr(device, "vkSetLatencyMarkerNV");
+            GetLatencyTimingsNV = (PFN_vkGetLatencyTimingsNV)vkGetDeviceProcAddr(device, "vkGetLatencyTimingsNV");
+            VkSemaphoreTypeCreateInfo tci = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+            tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            VkSemaphoreCreateInfo semci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            semci.pNext = &tci;
+            if(!SetLatencySleepModeNV || !LatencySleepNV || !SetLatencyMarkerNV || !GetLatencyTimingsNV || vkCreateSemaphore(device, &semci, NULL, &latencysem) != VK_SUCCESS)
+                haslowlatency = false;
+            latencyvalue = 0;
+        }
 
         GetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
         GetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR");
@@ -1297,6 +1383,7 @@ bool vk_init()
     wanttear = vsynctear;
     SDL_AtomicSet(&swapdirty, 1);
     if(!queuelock) queuelock = SDL_CreateMutex();
+    if(!swaplock) swaplock = SDL_CreateMutex();
     if(!presentlock)
     {
         presentlock = SDL_CreateMutex();
@@ -1338,6 +1425,9 @@ void vk_shutdown()
         vkrt_shutdown();
         vk_dlssshutdown();
         ngx_shutdown();
+        if(latencysem) vkDestroySemaphore(device, latencysem, NULL);
+        latencysem = VK_NULL_HANDLE;
+        haslowlatency = haspresentid = false;
         destroyswapchain();
         if(cmdpool) vkDestroyCommandPool(device, cmdpool, NULL);
         cmdpool = VK_NULL_HANDLE;
@@ -1720,7 +1810,7 @@ void vk_present()
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signaldone;
-    VkResult r = submit(si, f.fence);
+    VkResult r = submit(si, f.fence, latencyframe);
     if(r != VK_SUCCESS) fatal("Vulkan: submitting the frame failed: %s", resultname(r));
 
     fglastgen = numgen;
@@ -1739,7 +1829,10 @@ void vk_present()
     lastjobtime = now;
     lastcputime = cputime;
 
+    latencymarker(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV, latencyframe);
+
     presentjob job;
+    job.frameid = latencyframe;
     job.slot = curframe;
     job.numgen = numgen;
     job.evalvalue = evalcounter;
@@ -1760,6 +1853,100 @@ void vk_setvsync(int vsync, int tear)
 }
 
 bool vk_hastear() { return hasrelaxed; }
+
+// 0 off, 1 on, 2 on with the GPU's clocks kept up (Reflex's boost)
+VARF(IDF_PERSIST, lowlatency, 0, 1, 2, { SDL_AtomicSet(&sleepmodedirty, 1); SDL_AtomicSet(&swapdirty, 1); });
+ICOMMANDV(0, lowlatencyavailable, vkactive ? (haslowlatency ? 2 : 1) : 0);
+
+// at the start of a frame, before input: sleeps for as long as the frame would otherwise wait to be shown
+static double latencysleeptime = 0, latencywaittime = 0; // smoothed, in seconds
+
+void vk_latencysleep()
+{
+    if(!vkactive) return;
+    latencyframe++;
+    double sleepstart = seconds();
+    if(haslowlatency)
+    {
+        SDL_LockMutex(swaplock);
+        VkSwapchainKHR sc = swapchain;
+        if(sc && SDL_AtomicGet(&sleepmodedirty))
+        {
+            SDL_AtomicSet(&sleepmodedirty, 0);
+            VkLatencySleepModeInfoNV mi = { VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV };
+            mi.lowLatencyMode = lowlatency ? VK_TRUE : VK_FALSE;
+            mi.lowLatencyBoost = lowlatency > 1 ? VK_TRUE : VK_FALSE;
+            mi.minimumIntervalUs = 0;
+            SetLatencySleepModeNV(device, sc, &mi);
+        }
+        bool slept = false;
+        if(sc && lowlatency)
+        {
+            VkLatencySleepInfoNV si = { VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV };
+            si.signalSemaphore = latencysem;
+            si.value = ++latencyvalue;
+            slept = LatencySleepNV(device, sc, &si) == VK_SUCCESS;
+        }
+        SDL_UnlockMutex(swaplock);
+        if(slept)
+        {
+            VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &latencysem;
+            wi.pValues = &latencyvalue;
+            vkWaitSemaphores(device, &wi, 100000000); // never more than 100ms, whatever the driver thinks
+        }
+    }
+    double waitstart = seconds();
+    latencysleeptime += (waitstart - sleepstart - latencysleeptime)*0.05;
+    // the wait for a free screen image happens here rather than once the frame is simulated, so it isn't latency; without
+    // the driver's sleep a frame also waits for the last one to go out, so frames don't queue up
+    if(lowlatency && numframes)
+    {
+        if(haslowlatency) waitslot((curframe+1)%numframes);
+        else loopi(numframes) waitslot(i);
+    }
+    latencywaittime += (seconds() - waitstart - latencywaittime)*0.05;
+    latencymarker(VK_LATENCY_MARKER_SIMULATION_START_NV, latencyframe);
+}
+
+void vk_latencymark(int marker) { latencymarker(VkLatencyMarkerNV(marker), latencyframe); }
+
+// what the driver measured over the last frames, from the start of the frame to it being shown
+static void vklatency()
+{
+    if(!vkactive || !haslowlatency) { conoutf(colourwhite, "Latency: no driver timings%s", vkactive && lowlatency ? ", frames wait for the last one instead" : ""); return; }
+    VkLatencyTimingsFrameReportNV reports[64];
+    loopi(64) { memset(&reports[i], 0, sizeof(reports[i])); reports[i].sType = VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV; }
+    VkGetLatencyMarkerInfoNV gi = { VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV };
+    gi.timingCount = 64;
+    gi.pTimings = reports;
+    SDL_LockMutex(swaplock);
+    if(swapchain) GetLatencyTimingsNV(device, swapchain, &gi);
+    else gi.timingCount = 0;
+    SDL_UnlockMutex(swaplock);
+    // frames from the last second or so with every mark in order
+    double todone = 0, topresent = 0, sim = 0;
+    int n = 0;
+    loopi(int(gi.timingCount))
+    {
+        const VkLatencyTimingsFrameReportNV &r = reports[i];
+        if(r.presentID + 200 < latencyframe || r.presentID > latencyframe) continue;
+        if(!r.simStartTimeUs || !r.simEndTimeUs || !r.presentEndTimeUs || !r.gpuRenderEndTimeUs) continue;
+        if(r.simEndTimeUs < r.simStartTimeUs || r.presentEndTimeUs < r.simStartTimeUs || r.gpuRenderEndTimeUs < r.simStartTimeUs) continue;
+        if(r.presentEndTimeUs - r.simStartTimeUs > 500000) continue;
+        todone += r.gpuRenderEndTimeUs - r.simStartTimeUs;
+        topresent += r.presentEndTimeUs - r.simStartTimeUs;
+        sim += r.simEndTimeUs - r.simStartTimeUs;
+        n++;
+    }
+    if(!n) { conoutf(colourwhite, "Latency: no complete frames yet"); result("0 0 0 0"); return; }
+    defformatstring(str, "%.2f %.2f %.2f %d", todone/n/1000, topresent/n/1000, sim/n/1000, n);
+    conoutf(colourwhite, "Latency: %.2f ms from a frame starting to the GPU finishing it, %.2f ms to it being presented, simulation %.2f ms, slept %.2f ms and waited %.2f ms before it (%d frames, low latency %s)",
+        todone/n/1000, topresent/n/1000, sim/n/1000, latencysleeptime*1000, latencywaittime*1000, n, lowlatency ? (lowlatency > 1 ? "on with boost" : "on") : "off");
+    result(str);
+}
+COMMAND(0, vklatency, "");
 
 // development aid like frametimes, for what was presented: "presents average-ms worst-ms 1%-low-fps" since the last call
 static void getpresenttimes()

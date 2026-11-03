@@ -25,6 +25,8 @@ extern void vk_partmotion(const void *owner, const void *part, const matrix4 &wo
 extern void vk_capturefg();         // after the scene: motion vectors and depth for frame generation
 extern void vk_capturehudless();    // once the scene is on screen and before the HUD goes over it
 extern void vk_setvsync(int vsync, int tear);
+extern void vk_latencysleep();      // the start of a frame, before input
+extern void vk_latencymark(int marker); // VkLatencyMarkerNV: 1 simulation end, 2 render submission start, 6 input sample
 
 extern bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, const matrix4 &prevscreen);
 

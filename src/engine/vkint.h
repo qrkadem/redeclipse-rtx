@@ -19,7 +19,8 @@ namespace vk
     // the presenting thread submits too, so every queue submission goes through this lock
     extern void lockqueue();
     extern void unlockqueue();
-    extern VkResult submit(const VkSubmitInfo2 &si, VkFence fence);
+    extern VkResult submit(const VkSubmitInfo2 &si, VkFence fence, uint64_t frameid = 0);
+    extern uint64_t currentframeid(); // the frame's latency id, for submit
     extern void queueidle();
     extern void imagebarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldlayout, VkImageLayout newlayout,
         VkPipelineStageFlags2 srcstage, VkAccessFlags2 srcaccess, VkPipelineStageFlags2 dststage, VkAccessFlags2 dstaccess,

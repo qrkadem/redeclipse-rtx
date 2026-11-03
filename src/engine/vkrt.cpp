@@ -1226,7 +1226,7 @@ void vkrt_trace()
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
-    if(submit(si, fence) != VK_SUCCESS)
+    if(submit(si, fence, currentframeid()) != VK_SUCCESS)
     {
         conoutf(colourred, "Ray tracing: submitting failed, turning it off");
         rtfailed = true;

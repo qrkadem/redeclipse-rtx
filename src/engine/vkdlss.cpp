@@ -208,7 +208,7 @@ void vk_dlssapply(GLuint outfbo)
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
-    if(submit(si, fence) != VK_SUCCESS) ok = false;
+    if(submit(si, fence, currentframeid()) != VK_SUCCESS) ok = false;
     GLenum backlayouts[4] = { GL_LAYOUT_COLOR_ATTACHMENT_EXT, GL_LAYOUT_COLOR_ATTACHMENT_EXT, GL_LAYOUT_COLOR_ATTACHMENT_EXT, GL_LAYOUT_SHADER_READ_ONLY_EXT };
     glwait(srdone, 4, texs, backlayouts);
 
