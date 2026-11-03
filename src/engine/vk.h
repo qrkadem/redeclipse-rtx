@@ -38,6 +38,21 @@ extern void vk_dlsscleanupgl();
 extern void vk_dlssshutdown();
 
 // ray tracing, see vkrt.cpp
+// an animated model's vertex for the ray traced scene, skinned there the way the GL shaders skin it
+struct rtskinvert
+{
+    float pos[4], weights[4];
+    uint bones; // four bone indices into the dual quaternions, a byte each
+    uint pad[3];
+};
+extern matrix4 vkrt_partworld;   // the model part being drawn, placed in the world, set before its meshes draw
+extern bool vkrt_capturing();    // animated models drawn now go into the ray traced scene
+extern bool vkrt_hasskel(const void *group);
+extern void vkrt_registerskel(const void *group, const rtskinvert *verts, int numverts, const uint *indices, int numindices);
+extern void vkrt_captureskel(const void *group, const void *owner, const void *part, const dualquat *bones, int numbones);
+extern void vkrt_beginframe();
+extern void vkrt_pausecapture(bool pause);
+extern bool vkrt_playershadows(); // players' sun shadows are traced, so the shadow map leaves them out
 extern bool vkrt_aoavailable();  // ray traced ambient occlusion is wanted and possible: picks the lighting shaders
 extern bool vkrt_sunavailable(); // the same for the sun's shadow
 extern bool vkrt_active();       // traced this frame, so the result can be read

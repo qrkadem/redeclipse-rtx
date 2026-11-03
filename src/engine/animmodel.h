@@ -1270,6 +1270,12 @@ struct animmodel : model
                 modelmatrix.mul(shadowmapping ? shadowmatrix : camprojmatrix, matrixstack[matrixpos]);
                 if(resize!=1) modelmatrix.scale(resize);
                 GLOBALPARAM(modelmatrix, modelmatrix);
+                if(vkrt_capturing())
+                {
+                    // where the part is, for the ray traced copy of an animated model (skelmodel.h)
+                    vkrt_partworld = matrixstack[matrixpos];
+                    if(resize!=1) vkrt_partworld.scale(resize);
+                }
                 if(gvelocity && !shadowmapping)
                 {
                     // where this part was last frame, for the motion DLSS works from

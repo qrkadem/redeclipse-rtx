@@ -1300,7 +1300,9 @@ void renderavatar()
     matrix4 oldprojmatrix = nojittermatrix;
 
     enableavatarmask();
+    vkrt_pausecapture(true); // the first person model isn't part of the traced scene
     game::renderavatar();
+    vkrt_pausecapture(false);
     disableavatarmask();
 
     projmatrix = oldprojmatrix;
@@ -2516,6 +2518,7 @@ void gl_drawframe()
     if(!noview)
     {
         vk_dlssnextjitter();
+        vkrt_beginframe();
         gl_drawview();
         vk_capturefg();
     }

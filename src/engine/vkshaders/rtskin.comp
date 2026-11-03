@@ -1,0 +1,51 @@
+// Skins an animated model's vertices for the ray traced scene, the way the GL vertex shaders do it: each vertex
+// blends up to four bones' dual quaternions by its weights (vkrt.cpp, skelmodel.h)
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+struct skinvert
+{
+    vec4 pos;
+    vec4 weights;
+    uint bones; // four bone indices, a byte each
+    uint pad0, pad1, pad2;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer vertbuf { skinvert v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer bonebuf { vec4 b[]; }; // real, dual per bone
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer outbuf { vec3 p[]; };
+
+layout(push_constant) uniform Params
+{
+    vertbuf verts;
+    bonebuf bones;
+    outbuf positions;
+    uint numverts;
+} pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if(i >= pc.numverts) return;
+    skinvert v = pc.verts.v[i];
+    uint b0 = v.bones&0xFFu;
+    vec4 real = pc.bones.b[b0*2]*v.weights.x, dual = pc.bones.b[b0*2+1]*v.weights.x;
+    for(int k = 1; k < 4; k++)
+    {
+        float w = v.weights[k];
+        if(w == 0.0) break;
+        uint bk = (v.bones >> (8*k))&0xFFu;
+        vec4 r = pc.bones.b[bk*2], d = pc.bones.b[bk*2+1];
+        if(dot(real, r) < 0.0) w = -w;
+        real += r*w;
+        dual += d*w;
+    }
+    float invlen = 1.0/length(real);
+    real *= invlen;
+    dual *= invlen;
+    vec3 p = v.pos.xyz;
+    pc.positions.p[i] = 2.0*(cross(real.xyz, cross(real.xyz, p) + p*real.w + dual.xyz) + dual.xyz*real.w - real.xyz*dual.w) + p;
+}

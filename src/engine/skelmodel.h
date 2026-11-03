@@ -1525,6 +1525,7 @@ struct skelmodel : animmodel
             skelcacheentry &sc = skel->checkskelcache(p, as, pitch, axis, forward, !d || !d->ragdoll || d->ragdoll->skel != skel->ragdoll || d->ragdoll->millis == lastmillis ? NULL : d->ragdoll);
             if(!(as->cur.anim&ANIM_NORENDER))
             {
+                if(d && vkrt_capturing()) rtcapture(d, p, sc);
                 int owner = &sc-&skel->skelcache[0];
                 vbocacheentry &vc = skel->usegpuskel ? *vbocache : checkvbocache(sc, owner);
                 vc.millis = lastmillis;
@@ -1571,6 +1572,38 @@ struct skelmodel : animmodel
                 skel->initragdoll(*d->ragdoll, sc, p);
                 d->ragdoll->init(d);
             }
+        }
+
+        // the ray traced scene gets this frame's bones and, once, the meshes they move (vkrt.cpp)
+        void rtcapture(dynent *d, part *p, const skelcacheentry &sc)
+        {
+            if(!sc.bdata) return;
+            if(!vkrt_hasskel(this))
+            {
+                vector<rtskinvert> verts;
+                vector<uint> indices;
+                loopv(meshes)
+                {
+                    skelmesh &m = *(skelmesh *)meshes[i];
+                    int base = verts.length();
+                    loopj(m.numverts)
+                    {
+                        const vert &v = m.verts[j];
+                        const blendcombo &c = blendcombos[v.blend];
+                        rtskinvert &r = verts.add();
+                        memset(&r, 0, sizeof(r));
+                        r.pos[0] = v.pos.x; r.pos[1] = v.pos.y; r.pos[2] = v.pos.z; r.pos[3] = 1;
+                        loopk(4)
+                        {
+                            r.weights[k] = c.weights[k];
+                            r.bones |= uint(c.interpbones[k]) << (8*k);
+                        }
+                    }
+                    loopj(m.numtris) loopk(3) indices.add(base + m.tris[j].vert[k]);
+                }
+                vkrt_registerskel(this, verts.getbuf(), verts.length(), indices.getbuf(), indices.length());
+            }
+            vkrt_captureskel(this, d, p, sc.bdata, skel->numinterpbones);
         }
 
         virtual bool load(const char *name, float smooth) = 0;

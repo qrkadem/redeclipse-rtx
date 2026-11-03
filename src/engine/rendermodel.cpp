@@ -834,6 +834,9 @@ int batcheddynamicmodelbounds(int mask, vec &bbmin, vec &bbmax)
 
 void rendershadowmodelbatches(bool dynmodel)
 {
+    // with ray traced sun shadows players are traced, but they're still drawn here, without writing anything, which is
+    // where the ones out of view get their bones for the traced scene
+    bool traced = shadowmapping == SM_CASCADE && vkrt_playershadows();
     loopv(batches)
     {
         modelbatch &b = batches[i];
@@ -845,7 +848,19 @@ void rendershadowmodelbatches(bool dynmodel)
             j = bm.next;
             if(!(bm.visible&(1<<shadowside))) continue;
             if(!rendered) { b.m->startrender(); rendered = true; }
+            // shadow maps draw with every write on; asking GL instead would stall a threaded driver once per model
+            bool hide = traced && !(bm.state.flags&MDL_MAPMODEL);
+            if(hide)
+            {
+                glDepthMask(GL_FALSE);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            }
             renderbatchedmodel(b.m, bm);
+            if(hide)
+            {
+                glDepthMask(GL_TRUE);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            }
         }
         if(rendered) b.m->endrender();
     }
