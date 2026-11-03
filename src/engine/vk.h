@@ -20,6 +20,8 @@ extern void vk_resize(int w, int h); // screen images follow the drawable size
 extern void vk_beginframe();         // GL draws into a screen image Vulkan is done with
 extern void vk_present();            // hands the screen image to Vulkan, which presents it
 extern void vk_snapshotview();      // when the G-buffer of the main view is set up
+extern int gvelocity;
+extern void vk_partmotion(const void *owner, const void *part, const matrix4 &world, matrix4 &cur, matrix4 &prev);
 extern void vk_capturefg();         // after the scene: motion vectors and depth for frame generation
 extern void vk_capturehudless();    // once the scene is on screen and before the HUD goes over it
 extern void vk_setvsync(int vsync, int tear);

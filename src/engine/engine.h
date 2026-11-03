@@ -538,7 +538,7 @@ extern int transparentlayer;
 
 extern GLenum hdrformat, stencilformat;
 extern int gw, gh, gdepthformat, ghasstencil;
-extern GLuint hdrtex, gdepthtex, gcolortex, gnormaltex, gglowtex, gdepthrb, gstencilrb, earlydepthtex;
+extern GLuint hdrtex, gdepthtex, gcolortex, gnormaltex, gglowtex, gdepthrb, gstencilrb, earlydepthtex, gvelocitytex;
 extern int msaasamples, msaalight;
 extern GLuint mshdrtex, msdepthtex, mscolortex, msnormaltex, msglowtex, msdepthrb, msstencilrb, msearlydepthtex;
 extern vector<vec2> msaapositions;

@@ -1270,6 +1270,15 @@ struct animmodel : model
                 modelmatrix.mul(shadowmapping ? shadowmatrix : camprojmatrix, matrixstack[matrixpos]);
                 if(resize!=1) modelmatrix.scale(resize);
                 GLOBALPARAM(modelmatrix, modelmatrix);
+                if(gvelocity && !shadowmapping)
+                {
+                    // where this part was last frame, for the motion DLSS works from
+                    matrix4 world = matrixstack[matrixpos], curvel, prevvel;
+                    if(resize!=1) world.scale(resize);
+                    vk_partmotion(drawtex ? NULL : d, this, world, curvel, prevvel);
+                    GLOBALPARAM(curmodelmatrix, curvel);
+                    GLOBALPARAM(prevmodelmatrix, prevvel);
+                }
 
                 if(!(anim&ANIM_NOSKIN))
                 {

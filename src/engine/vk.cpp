@@ -15,6 +15,7 @@ VAR(0, dbgvk, 0, 0, 1);
 
 bool vkactive = false;
 extern int dlssg, refreshrate;
+VAR(0, gvelocity, 1, 0, 0); // the G-buffer has a velocity target that models write their motion into, see model.cfg
 
 #define MAXVKFRAMES 2 // screen images GL and Vulkan take turns with
 
@@ -1244,6 +1245,18 @@ namespace vk
 
     static void storematrix(float *dst, const matrix4 &m) { memcpy(dst, m.a.v, 16*sizeof(float)); }
 
+    // models' own motion: each moving entity's parts as they were placed the frame before
+    struct partmotion
+    {
+        const void *owner, *part;
+        matrix4 cur, prev;
+        int frame;
+    };
+    static vector<partmotion> partmotions;
+    static int motionframe = 0;
+    static matrix4 velcurvp, velprevvp;
+    static bool velvpvalid = false;
+
     // the main view as the G-buffer was drawn with it
     matrix4 viewcam, viewproj, viewworld;
     vec viewpos(0, 0, 0);
@@ -1257,7 +1270,7 @@ using namespace vk;
 // -1 picks the count itself: the fewest that bring the presented rate up to the display's refresh rate
 VARF(IDF_PERSIST, dlssg, -1, 0, MAXFGGEN, { if(vkactive) framesdirty = true; });
 ICOMMANDV(0, vkpresenting, vkactive ? 1 : 0);
-VAR(0, dbgvkfg, 0, 0, 1); // prints the range of the frame generation inputs each frame
+VAR(0, dbgvkfg, 0, 0, 2); // prints the range of the frame generation inputs each frame, 2 also saves motion.png once
 
 SDL_Window *vk_createwindow(const char *caption, int x, int y, int w, int h, int flags)
 {
@@ -1299,6 +1312,7 @@ bool vk_init()
     }
     if(!pickdevice() || !createdevice() || !createswapchain() || !startpresent()) { vk_shutdown(); return false; }
     vkactive = true;
+    gvelocity = 1;
     conoutf(colourwhite, "Vulkan: %s (Vulkan %u.%u.%u), presenting %ux%u %s%s", devprops.deviceName,
         VK_VERSION_MAJOR(devprops.apiVersion), VK_VERSION_MINOR(devprops.apiVersion), VK_VERSION_PATCH(devprops.apiVersion),
         swapextent.width, swapextent.height, presentmodename(presentmode), hasrt ? ", ray queries on" : "");
@@ -1342,6 +1356,9 @@ void vk_shutdown()
     instance = VK_NULL_HANDLE;
     physdev = VK_NULL_HANDLE;
     vkactive = false;
+    gvelocity = 0;
+    velvpvalid = false;
+    partmotions.setsize(0);
     hasrt = false;
 }
 
@@ -1430,6 +1447,42 @@ void vk_snapshotview()
     viewright = camright;
     viewup = camup;
     viewfresh = true;
+
+    // a new frame for the models' motion
+    motionframe++;
+    matrix4 vp;
+    vp.muld(viewproj, viewcam);
+    velprevvp = velvpvalid ? velcurvp : vp;
+    velcurvp = vp;
+    velvpvalid = true;
+    loopvrev(partmotions) if(partmotions[i].frame < motionframe-2) partmotions.removeunordered(i);
+}
+
+// a model part's placement this frame and last, as clip space matrices for the velocity target; parts of no entity
+// only move with the camera
+void vk_partmotion(const void *owner, const void *part, const matrix4 &world, matrix4 &cur, matrix4 &prev)
+{
+    cur.mul(velcurvp, world);
+    if(!owner) { prev.mul(velprevvp, world); return; }
+    loopv(partmotions)
+    {
+        partmotion &p = partmotions[i];
+        if(p.owner != owner || p.part != part) continue;
+        if(p.frame != motionframe)
+        {
+            p.prev = p.frame == motionframe-1 ? p.cur : world;
+            p.cur = world;
+            p.frame = motionframe;
+        }
+        prev.mul(velprevvp, p.prev);
+        return;
+    }
+    partmotion &p = partmotions.add();
+    p.owner = owner;
+    p.part = part;
+    p.cur = p.prev = world;
+    p.frame = motionframe;
+    prev.mul(velprevvp, world);
 }
 
 // motion to where each pixel was the frame before, in pixels, and depth as the depth buffer holds it, from the main
@@ -1458,6 +1511,8 @@ bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, const matri
     vectorshader->set();
     LOCALPARAM(curmatrix, curm);
     LOCALPARAM(prevmatrix, prevm);
+    glActiveTexture_(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_RECTANGLE, gvelocitytex);
     glActiveTexture_(GL_TEXTURE0);
     if(msaalight) glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, msdepthtex);
     else glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
@@ -1541,6 +1596,19 @@ void vk_capturefg()
         int c = (gh/2)*gw + gw/2;
         conoutf(colourwhite, "fg: motion x %.2f..%.2f (mean %.2f) y %.2f..%.2f (mean %.2f), centre %.2f %.2f, depth %.5f..%.5f centre %.5f%s",
             mx[0], Mx[0], sum[0]/(gw*gh), mx[1], Mx[1], sum[1]/(gw*gh), motion[c*2], motion[c*2+1], dmin, dmax, depth[c], reset ? " reset" : "");
+        if(dbgvkfg > 1)
+        {
+            // the motion as a picture, grey where nothing moves
+            ImageData img(gw, gh, 3);
+            loopi(gw*gh)
+            {
+                img.data[i*3+0] = uchar(clamp(128 + motion[i*2]*4, 0.0f, 255.0f));
+                img.data[i*3+1] = uchar(clamp(128 + motion[i*2+1]*4, 0.0f, 255.0f));
+                img.data[i*3+2] = 128;
+            }
+            saveimage("motion.png", img, IFMT_PNG, 9, true);
+            dbgvkfg = 0;
+        }
         delete[] motion;
         delete[] depth;
     }

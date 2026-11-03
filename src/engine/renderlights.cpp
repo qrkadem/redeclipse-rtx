@@ -1,7 +1,7 @@
 #include "engine.h"
 
 int gw = -1, gh = -1, bloomw = -1, bloomh = -1, lasthdraccum = 0;
-GLuint gfbo = 0, gdepthtex = 0, gcolortex = 0, gnormaltex = 0, gglowtex = 0, gdepthrb = 0, gstencilrb = 0;
+GLuint gfbo = 0, gdepthtex = 0, gcolortex = 0, gnormaltex = 0, gglowtex = 0, gdepthrb = 0, gstencilrb = 0, gvelocitytex = 0;
 bool gdepthinit = false;
 int scalew = -1, scaleh = -1;
 GLuint scalefbo[2] = { 0, 0 }, scaletex[2] = { 0, 0 };
@@ -585,7 +585,7 @@ ICOMMANDV(0, usepacknorm, usepacknorm() ? 1 : 0);
 
 void maskgbuffer(const char *mask)
 {
-    GLenum drawbufs[4];
+    GLenum drawbufs[5];
     int numbufs = 0;
     while(*mask) switch(*mask++)
     {
@@ -593,6 +593,12 @@ void maskgbuffer(const char *mask)
         case 'n': drawbufs[numbufs++] = GL_COLOR_ATTACHMENT1; break;
         case 'd': if(gdepthformat) drawbufs[numbufs++] = GL_COLOR_ATTACHMENT3; break;
         case 'g': drawbufs[numbufs++] = GL_COLOR_ATTACHMENT2; break;
+        case 'v':
+            // the velocity target sits where model shaders write it, after the slots they may leave out
+            if(!gvelocitytex) break;
+            while(numbufs < (gdepthformat ? 4 : 3)) drawbufs[numbufs++] = GL_NONE;
+            drawbufs[numbufs++] = GL_COLOR_ATTACHMENT4;
+            break;
     }
     glDrawBuffers_(numbufs, drawbufs);
 }
@@ -856,6 +862,13 @@ void setupgbuffer()
         glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_RECTANGLE, gnormaltex, 0);
         glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_RECTANGLE, gglowtex, 0);
         if(gdepthformat) glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_RECTANGLE, gdepthtex, 0);
+        if(gvelocity)
+        {
+            // models' own motion for DLSS, see vk.cpp
+            if(!gvelocitytex) glGenTextures(1, &gvelocitytex);
+            createtexture(gvelocitytex, gw, gh, NULL, 3, 0, GL_RGBA16F, GL_TEXTURE_RECTANGLE);
+            glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT4, GL_TEXTURE_RECTANGLE, gvelocitytex, 0);
+        }
 
         if(glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         {
@@ -940,6 +953,7 @@ void cleanupgbuffer()
     if(gcolortex) { glDeleteTextures(1, &gcolortex); gcolortex = 0; }
     if(gnormaltex) { glDeleteTextures(1, &gnormaltex); gnormaltex = 0; }
     if(gglowtex) { glDeleteTextures(1, &gglowtex); gglowtex = 0; }
+    if(gvelocitytex) { glDeleteTextures(1, &gvelocitytex); gvelocitytex = 0; }
     if(gstencilrb) { glDeleteRenderbuffers_(1, &gstencilrb); gstencilrb = 0; }
     if(gdepthrb) { glDeleteRenderbuffers_(1, &gdepthrb); gdepthrb = 0; }
     if(hdrfbo) { glDeleteFramebuffers_(1, &hdrfbo); hdrfbo = 0; }
@@ -5383,6 +5397,15 @@ void preparegbuffer(bool depthclear, bool resetbatches)
     else maskgbuffer("cnd");
     if(gcolorclear) glClearColor(0, 0, 0, 0);
     glClear((depthclear ? GL_DEPTH_BUFFER_BIT : 0)|(gcolorclear ? GL_COLOR_BUFFER_BIT : 0)|(depthclear && ghasstencil && (!msaasamples || msaalight || ghasstencil > 1) ? GL_STENCIL_BUFFER_BIT : 0));
+    if(gvelocitytex && !drawtex)
+    {
+        // nothing has its own motion until a model draws
+        static const GLenum velocitybuf = GL_COLOR_ATTACHMENT4;
+        glDrawBuffers_(1, &velocitybuf);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        maskgbuffer("cnd");
+    }
     if(gdepthformat && gdepthclear) maskgbuffer("cnd");
     if(drawtex && gdepthinit) glDisable(GL_SCISSOR_TEST);
     gdepthinit = true;
@@ -5414,6 +5437,8 @@ void rendergbuffer(bool depthclear)
     renderdecals();
     GLERROR;
     endtimer(geomtimer);
+    bool velocity = gvelocitytex && !drawtex;
+    if(velocity) maskgbuffer("cndv"); // models write their motion
     timer *mmtimer = drawtex ? NULL : begintimer("G-Buffer map models", false);
     rendermapmodels();
     GLERROR;
@@ -5431,6 +5456,7 @@ void rendergbuffer(bool depthclear)
         rendermodelbatches();
         GLERROR;
         endtimer(mdltimer);
+        if(velocity) maskgbuffer("cnd");
         if(!drawtex)
         {
             renderstains(STAINBUF_OPAQUE, true);
