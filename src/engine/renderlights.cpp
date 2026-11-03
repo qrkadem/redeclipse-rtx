@@ -5663,11 +5663,19 @@ void renderreflections()
     defformatstring(name, "reflection%s", opts);
     Shader *s = generateshader(name, "reflectionshader \"%s\"", opts);
 
+    // a full screen pass adding to the lit scene: the scene's depth has to stay as it is for the transparent geometry,
+    // particles and edit outlines drawn after it, which the quad's own depth hid
+    GLboolean depthtest = glIsEnabled(GL_DEPTH_TEST), depthwrite = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthwrite);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE);
     s->set();
     screenquad();
     glDisable(GL_BLEND);
+    if(depthtest) glEnable(GL_DEPTH_TEST);
+    glDepthMask(depthwrite);
 
     endtimer(refltimer);
 }

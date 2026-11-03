@@ -1929,6 +1929,48 @@ void texview(const char *name, float dist, float angle, int nth)
 }
 ICOMMAND(0, texview, "sffi", (char *name, float *dist, float *angle, int *nth), texview(name, *dist, *angle, *nth));
 
+// development aid: "x y z yaw pitch" for a camera dist away facing the nth largest surface of a material (death, clip,
+// glass...), and the surface's centre and size after, for gotopos
+static void matview(const char *name, float dist, int nth)
+{
+    int mat = findmaterial(name, false);
+    if(mat < 0) { result(""); return; }
+    struct found { vec centre; float area; int orient; vec size; };
+    vector<found> surfs;
+    loopv(valist)
+    {
+        vtxarray *va = valist[i];
+        loopj(va->matsurfs)
+        {
+            const materialsurface &m = va->matbuf[j];
+            bool match = mat&MATF_FLAGS ? (m.material&mat) != 0 : (m.material&MATF_VOLUME) == mat;
+            if(!match) continue;
+            int dim = dimension(m.orient), c = C[dim], r = R[dim];
+            vec centre(m.o), size(0, 0, 0);
+            centre[c] += m.csize*0.5f;
+            centre[r] += m.rsize*0.5f;
+            size[c] = m.csize;
+            size[r] = m.rsize;
+            found &f = surfs.add();
+            f.centre = centre;
+            f.area = float(m.csize)*m.rsize;
+            f.orient = m.orient;
+            f.size = size;
+        }
+    }
+    if(surfs.empty()) { result(""); return; }
+    surfs.sort([](const found &a, const found &b) { return a.area > b.area; });
+    const found &f = surfs[clamp(nth, 0, surfs.length()-1)];
+    vec normal(0, 0, 0);
+    normal[dimension(f.orient)] = dimcoord(f.orient) ? 1 : -1;
+    vec cam = vec(normal).mul(dist).add(f.centre);
+    float yaw, pitch;
+    vectoyawpitch(vec(f.centre).sub(cam), yaw, pitch);
+    defformatstring(str, "%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d %d", cam.x, cam.y, cam.z, yaw, pitch, f.centre.x, f.centre.y, f.centre.z, int(f.size.magnitude()), surfs.length());
+    result(str);
+}
+ICOMMAND(0, matview, "sfi", (char *name, float *dist, int *nth), matview(name, *dist, *nth));
+
 // development aid: "x y z yaw" of the nth entity of a type, for putting the camera where players start
 ICOMMAND(0, entview, "ii", (int *type, int *nth),
 {
