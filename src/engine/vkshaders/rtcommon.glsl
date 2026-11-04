@@ -1,0 +1,188 @@
+// What the ray traced passes share (vkrt.cpp): the scene's geometry, materials and lights, the parameters, and how
+// what a ray hits off screen is lit. Each pass declares its own images at bindings 3 to 5.
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+struct geometry
+{
+    uint64_t positions; // vec3 per vertex, in the instance's own space
+    uint64_t indices;   // three per triangle, or 0 for three vertices per triangle in order
+    uint64_t texcoords; // vec2 per vertex, or 0
+    uint64_t materials; // a material per triangle, or 0 for the one in material
+    uint material;
+    uint pad0, pad1, pad2;
+};
+struct material
+{
+    vec4 color; // rgb times the texture, w its layer, < 0 none
+    vec4 glow;  // rgb glow colour, w its layer, < 0 none
+};
+struct lightsource
+{
+    vec4 pos;   // xyz, w radius
+    vec4 color; // rgb, w 1 when it casts no shadow
+    vec4 spot;  // xyz from the spot's target towards the light, w 1/(1 - cos of the spot's angle), 0 for a point light
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer geometrybuf { geometry g[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer materialbuf { material m[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer posbuf { vec3 p[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer indexbuf { uint i[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer tcbuf { vec2 t[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer matidbuf { uint m[]; };
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D positions; // world position, w 0 where nothing was drawn
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D normals;   // w roughness
+layout(set = 0, binding = 6) uniform sampler2DArray textures;
+layout(set = 0, binding = 7, std140) uniform Params
+{
+    mat4 viewproj;  // world to this frame's clip space
+    vec4 campos;    // xyz camera, w frame number
+    vec4 sundir;    // xyz towards the sun, w the sun's radius as a tangent, < 0 without sun
+    vec4 suncolor;
+    vec4 ambient;   // rgb, w how bright glow is
+    vec4 skycolor;  // rgb light from the open sky, w 1 when there is any
+    vec4 fogcolor;
+    vec4 fog;       // x density, y scale, z debugging: 1 shows which hits were seen on screen, 2 makes everything a mirror, w number of lights
+    vec4 params;    // x roughness that gets no reflection rays, y farthest a reflection ray looks, z a pixel's angle, w texture size
+    vec4 gi;        // x farthest an indirect light ray looks, y how strong indirect light is, z how strong the sky is in it
+    geometrybuf geometries;
+    materialbuf materials;
+} pc;
+layout(set = 0, binding = 8, scalar) readonly buffer Lights { lightsource lights[]; };
+
+uint hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float rnd(inout uint seed)
+{
+    seed = hash(seed);
+    return float(seed) * (1.0/4294967296.0);
+}
+
+void basis(vec3 n, out vec3 t, out vec3 b)
+{
+    t = normalize(abs(n.z) < 0.999 ? cross(n, vec3(0.0, 0.0, 1.0)) : cross(n, vec3(1.0, 0.0, 0.0)));
+    b = cross(n, t);
+}
+
+bool occluded(vec3 o, vec3 d, float tmax)
+{
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFFu, o, 0.0, d, tmax);
+    while(rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// a microfacet normal seen from v (z up), by the GGX distribution of visible normals (spherical caps)
+vec3 sampleggx(vec3 v, float alpha, vec2 u)
+{
+    vec3 vh = normalize(vec3(alpha*v.x, alpha*v.y, v.z));
+    float phi = 6.28318531*u.x;
+    float z = (1.0 - u.y)*(1.0 + vh.z) - vh.z;
+    float sintheta = sqrt(clamp(1.0 - z*z, 0.0, 1.0));
+    vec3 h = vec3(sintheta*cos(phi), sintheta*sin(phi), z) + vh;
+    return normalize(vec3(alpha*h.x, alpha*h.y, max(h.z, 1.0e-6)));
+}
+
+// the light leaving what a ray hit back along it, lit the way the deferred shading lights the scene: the texture is
+// read at the mip the ray's cone covers there, footprint wide where the ray started and widening by spread per unit;
+// the ambient and fog are left out when the light is for a surface that has its own
+vec3 shade(uint inst, uint prim, vec2 bary, mat4x3 world, vec3 hitpos, vec3 d, float hitt, float footprint, float spread, bool ambient, bool fogged, inout uint seed)
+{
+    geometry g = pc.geometries.g[inst];
+    uvec3 idx = uvec3(prim*3u) + uvec3(0u, 1u, 2u);
+    if(g.indices != 0) { indexbuf ib = indexbuf(g.indices); idx = uvec3(ib.i[idx.x], ib.i[idx.y], ib.i[idx.z]); }
+    posbuf pb = posbuf(g.positions);
+    vec3 p0 = pb.p[idx.x], p1 = pb.p[idx.y], p2 = pb.p[idx.z], cr = cross(p1 - p0, p2 - p0);
+    float area = length(cr);
+    // slivers, like the world's t-junction fillers, have no normal of their own: they face the ray
+    vec3 n = mat3(world) * cr;
+    n = dot(n, n) > 1.0e-12 ? normalize(n) : -d;
+    if(dot(n, d) > 0.0) n = -n;
+
+    material m = pc.materials.m[g.materials != 0 ? matidbuf(g.materials).m[prim] : g.material];
+    vec3 albedo = m.color.rgb, glow = vec3(0.0);
+    if(g.texcoords != 0 && (m.color.w >= 0.0 || m.glow.w >= 0.0))
+    {
+        tcbuf tb = tcbuf(g.texcoords);
+        vec2 t0 = tb.t[idx.x], t1 = tb.t[idx.y], t2 = tb.t[idx.z], e1 = t1 - t0, e2 = t2 - t0;
+        vec2 tc = t0 + e1*bary.x + e2*bary.y;
+        // the texture's mip from how wide the ray's cone has grown and how often the texture repeats there
+        float repeat = sqrt(abs(e1.x*e2.y - e1.y*e2.x)/max(area, 1.0e-8))/max(length(world[0]), 1.0e-6),
+              lod = log2(max((footprint + hitt*spread)*repeat*pc.params.w, 1.0e-6));
+        if(m.color.w >= 0.0) albedo *= textureLod(textures, vec3(tc, m.color.w), lod).rgb;
+        if(m.glow.w >= 0.0) glow = textureLod(textures, vec3(tc, m.glow.w), lod).rgb * m.glow.rgb * pc.ambient.w;
+    }
+
+    vec3 o = hitpos + n*(0.05 + hitt*0.001), light = ambient ? pc.ambient.rgb : vec3(0.0);
+    if(ambient && pc.skycolor.w > 0.0)
+    {
+        // how much of the sky it sees, one cosine weighted ray at a time
+        vec3 t, b;
+        basis(n, t, b);
+        float r1 = rnd(seed), r2 = rnd(seed), r = sqrt(r1), phi = 6.28318531*r2;
+        vec3 sd = normalize(t*(r*cos(phi)) + b*(r*sin(phi)) + n*sqrt(max(1.0 - r1, 0.0)));
+        if(!occluded(o, sd, 1.0e6)) light += pc.skycolor.rgb;
+    }
+    if(pc.sundir.w >= 0.0)
+    {
+        float facing = dot(n, pc.sundir.xyz);
+        if(facing > 0.0)
+        {
+            vec3 t, b;
+            basis(pc.sundir.xyz, t, b);
+            float r = sqrt(rnd(seed))*pc.sundir.w, phi = 6.28318531*rnd(seed);
+            vec3 sd = normalize(pc.sundir.xyz + t*(r*cos(phi)) + b*(r*sin(phi)));
+            if(!occluded(o, sd, 1.0e6)) light += pc.suncolor.rgb*facing;
+        }
+    }
+    // every light reaching the hit adds its unshadowed light, and one, picked by how much it adds, is tested for its
+    // shadow: on average that is each light's own shadowed light
+    int numlights = int(pc.fog.w);
+    float total = 0.0, pickw = 0.0, pickdist = 0.0;
+    vec3 pickc = vec3(0.0), pickdir = vec3(0.0);
+    bool pickshadow = false;
+    for(int i = 0; i < numlights; i++)
+    {
+        lightsource l = lights[i];
+        vec3 ld = l.pos.xyz - hitpos;
+        float dist2 = dot(ld, ld);
+        if(dist2 >= l.pos.w*l.pos.w) continue;
+        float invdist = inversesqrt(dist2), facing = dot(ld, n)*invdist;
+        if(facing <= 0.0) continue;
+        float atten = 1.0 - dist2*invdist/l.pos.w;
+        if(l.spot.w > 0.0)
+        {
+            float spotatten = 1.0 - (1.0 - dot(ld, l.spot.xyz)*invdist)*l.spot.w;
+            if(spotatten <= 0.0) continue;
+            atten *= spotatten;
+        }
+        vec3 c = l.color.rgb*(facing*atten);
+        float w = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        if(w <= 0.0) continue;
+        total += w;
+        if(rnd(seed)*total < w)
+        {
+            pickw = w;
+            pickc = c;
+            pickdir = ld*invdist;
+            pickdist = dist2*invdist;
+            pickshadow = l.color.w < 0.5;
+        }
+    }
+    if(pickw > 0.0 && (!pickshadow || pickdist <= 1.0 || !occluded(o, pickdir, pickdist - 1.0))) light += pickc*(total/pickw);
+
+    vec3 color = albedo*light + glow;
+    if(!fogged) return color;
+    float foglerp = clamp(exp2(distance(pc.campos.xyz, hitpos)*pc.fog.x)*pc.fog.y, 0.0, 1.0);
+    return mix(pc.fogcolor.rgb, color, foglerp);
+}

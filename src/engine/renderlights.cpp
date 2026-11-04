@@ -2619,7 +2619,8 @@ void radiancehints::bindparams()
 
 bool useradiancehints()
 {
-    return !worldcols[WORLDCOL_F_SUNLIGHT].iszero() && csmshadowmap && gi && getgiscale() && getgidist();
+    // ray traced indirect light has the sun's bounce and the sky in it
+    return !worldcols[WORLDCOL_F_SUNLIGHT].iszero() && csmshadowmap && gi && getgiscale() && getgidist() && !vkrt_giavailable();
 }
 
 // UI viewports go without GI, it costs as much as the rest of their lighting and moves the main view's cached GI
@@ -2839,7 +2840,7 @@ Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
         {
             if(avatar && aoon() && getaosun()) sun[sunlen++] = 'A';
             if(vkrt_sunavailable()) sun[sunlen++] = 'T';
-            if(!nogi && gi && getgiscale() && getgidist())
+            if(!nogi && gi && getgiscale() && getgidist() && !vkrt_giavailable())
             {
                 userh = rhsplits;
                 sun[sunlen++] = 'r';
@@ -2850,6 +2851,7 @@ Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
     if(!minimap)
     {
         if(avatar && aoon()) sun[sunlen++] = 'a';
+        if(avatar && vkrt_giavailable()) sun[sunlen++] = 'i';
         if(lighttilebatch && (!usecsm || batchsunlight > (userh ? 1 : 0))) sun[sunlen++] = 'b';
     }
     sun[sunlen] = '\0';
@@ -3114,6 +3116,11 @@ static void bindlighttexs(int msaapass = 0, bool transparent = false)
     {
         glActiveTexture_(GL_TEXTURE6 + i);
         glBindTexture(GL_TEXTURE_3D, rhtex[i]);
+    }
+    if(vkrt_giavailable())
+    {
+        glActiveTexture_(GL_TEXTURE12);
+        glBindTexture(GL_TEXTURE_RECTANGLE, vkrt_gitexture());
     }
     if(smalpha && alphashadow)
     {
@@ -5582,37 +5589,35 @@ static const float envmapldrscale = 1.0f;
 
 bool reflectionsenabled() { return reflections && !drawtex && !msaasamples && !(editmode && fullbright); }
 
-// ray traced reflections: the lit scene, how it was lit, and the lights that can reach what is reflected, so what
-// rays hit off screen is lit the same way
-static GLuint tracereflections()
+// how the scene is lit and the lights that can reach what rays hit, so the ray traced passes light what they hit off
+// screen the way the deferred shading would
+void getrtshading(rtshading &s, vector<rtlight> &rl)
 {
-    if(!vkrt_reflavailable()) return 0;
     float lightscale = 2.0f*ldrscaleb;
-    rtreflshading s;
     bvec amb = worldcols[WORLDCOL_F_AMBIENT], pie = worldcols[WORLDCOL_F_SUNLIGHT];
     s.ambient = vec(amb.x, amb.y, amb.z).mul(lightscale*getambientscale());
     s.glowscale = 255*lightscale;
     s.sun = !pie.iszero() && getpielightscale() > 0;
     s.suncolor = vec(pie.x, pie.y, pie.z).mul(lightscale*getpielightscale());
     s.sundir = getpielightdir();
-    // the open sky lights through GI, where the map has it
-    if(s.sun && useradiancehints())
+    // the open sky lights through GI, where the map has it: the radiance hints give a surface open to the whole sky
+    // about 0.4 of their sky light colour, so a ray reaching the sky brings that much
+    if(s.sun && csmshadowmap && gi && getgiscale() && getgidist())
     {
         bvec piesky = getskylight();
-        s.skycolor = vec(piesky.x, piesky.y, piesky.z).mul(2*getgiaoscale()*lightscale*getskylightscale());
+        s.skycolor = vec(piesky.x, piesky.y, piesky.z).mul(0.4f*2*getgiaoscale()*lightscale*getskylightscale());
     }
     else s.skycolor = vec(0, 0, 0);
     s.fogcolor = curfogcolor;
     s.fogdensity = curfogdensity.x;
     s.fogscale = curfogdensity.y;
 
-    static vector<rtrefllight> rl;
     rl.setsize(0);
     loopv(lights)
     {
         const lightinfo &l = lights[i];
         if(l.radius <= 0 || l.color.iszero()) continue;
-        rtrefllight &r = rl.add();
+        rtlight &r = rl.add();
         r.o = l.o;
         r.radius = l.radius;
         r.color = vec(l.color).mul(lightscale);
@@ -5628,7 +5633,6 @@ static GLuint tracereflections()
             r.spotscale = 0;
         }
     }
-    return vkrt_reflect(hdrfbo, vieww, viewh, s, rl.getbuf(), rl.length());
 }
 
 void renderreflections()
@@ -5637,7 +5641,7 @@ void renderreflections()
 
     timer *refltimer = begintimer("Reflections");
 
-    GLuint rttex = tracereflections();
+    GLuint rttex = vkrt_reflavailable() ? vkrt_reflect(hdrfbo, vieww, viewh) : 0;
     bool ssr = reflssr && !rttex;
     if(ssr)
     {

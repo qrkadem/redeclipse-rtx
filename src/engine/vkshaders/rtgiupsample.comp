@@ -1,0 +1,54 @@
+// Ray traced indirect light, from the half resolution it was traced at back up to each pixel (vkrt.cpp): the four
+// nearest half resolution samples, weighted by how near they are and how alike their surface is to this pixel's, so
+// light doesn't bleed across edges; a pixel none of them is like takes the most alike.
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;        // half resolution light
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D halfpos;    // the surfaces it was traced from
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D halfnormal;
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D positions;  // this pixel's surface
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D normals;
+
+layout(push_constant) uniform Params
+{
+    vec4 campos; // xyz camera
+    vec4 params;
+} pc;
+
+void main()
+{
+    ivec2 size = imageSize(positions), halfsize = imageSize(src);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p);
+    if(wp.w <= 0.0)
+    {
+        imageStore(dst, p, vec4(0.0));
+        return;
+    }
+    vec3 n = normalize(imageLoad(normals, p).xyz);
+    float planescale = 1.0/(0.01*distance(wp.xyz, pc.campos.xyz) + 0.1);
+    vec2 hp = (vec2(p) + 0.5)*0.5 - 0.5;
+    ivec2 base = ivec2(floor(hp));
+    vec2 f = hp - vec2(base);
+    vec3 sum = vec3(0.0), best = vec3(0.0);
+    float total = 0.0, bestw = -1.0;
+    for(int y = 0; y < 2; y++) for(int x = 0; x < 2; x++)
+    {
+        ivec2 q = clamp(base + ivec2(x, y), ivec2(0), halfsize - 1);
+        vec4 qp = imageLoad(halfpos, q);
+        if(qp.w <= 0.0) continue;
+        vec3 qn = imageLoad(halfnormal, q).xyz;
+        float alike = pow(max(dot(n, qn), 0.0), 16.0) * exp(-abs(dot(qp.xyz - wp.xyz, n))*planescale),
+              w = (x == 1 ? f.x : 1.0 - f.x)*(y == 1 ? f.y : 1.0 - f.y)*alike;
+        vec3 c = imageLoad(src, q).rgb;
+        sum += c*w;
+        total += w;
+        if(alike > bestw) { bestw = alike; best = c; }
+    }
+    imageStore(dst, p, vec4(total > 1.0e-4 ? sum/total : best, 1.0));
+}

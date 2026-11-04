@@ -1,0 +1,88 @@
+// Ray traced indirect light over time (vkrt.cpp): each frame's ray blends into what the same surface gathered before,
+// found where it was last frame, and the spread of what it gathered is kept too, so the filter after knows how much
+// it still has to smooth. A ray far brighter than all its neighbours is cut down first: it found some small bright
+// spot, and would stand out for as long as the history kept it.
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D positions;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D raw;       // this frame's rays
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D prevcolor; // rgb light, a frames
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D prevaux;   // x mean brightness, y mean square, z distance to the camera
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D curcolor;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D curaux;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D filtered; // rgb light, a its variance, for the filter
+
+layout(push_constant) uniform Params
+{
+    mat4 prevclip;   // world to last frame's clip space
+    vec4 campos;     // xyz camera
+    vec4 prevcampos; // xyz last frame's camera
+    vec4 params;     // x most frames kept
+} pc;
+
+const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
+
+void main()
+{
+    ivec2 size = imageSize(positions);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p);
+    if(wp.w <= 0.0)
+    {
+        imageStore(curcolor, p, vec4(0.0));
+        imageStore(curaux, p, vec4(0.0));
+        imageStore(filtered, p, vec4(0.0));
+        return;
+    }
+    vec3 c = imageLoad(raw, p).rgb;
+
+    // the neighbours: how bright the brightest is, and the spread, for surfaces with little history yet
+    float brightest = 0.0, s1 = 0.0, s2 = 0.0, n = 0.0;
+    for(int y = -1; y <= 1; y++) for(int x = -1; x <= 1; x++)
+    {
+        ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+        if(imageLoad(positions, q).w <= 0.0) continue;
+        float l = dot(imageLoad(raw, q).rgb, lum);
+        if(x != 0 || y != 0) brightest = max(brightest, l);
+        s1 += l;
+        s2 += l*l;
+        n += 1.0;
+    }
+    float l = dot(c, lum), limit = 2.0*brightest + 0.01;
+    if(l > limit)
+    {
+        c *= limit/l;
+        l = limit;
+    }
+    float spatialvar = max(s2/n - (s1/n)*(s1/n), 0.0);
+
+    float surfdist = distance(wp.xyz, pc.campos.xyz), count = 1.0, m1 = l, m2 = l*l;
+    vec3 color = c;
+    vec4 prev = pc.prevclip * vec4(wp.xyz, 1.0);
+    if(prev.w > 0.0)
+    {
+        ivec2 q = ivec2(floor((prev.xy/prev.w*0.5 + 0.5)*vec2(size)));
+        if(q.x >= 0 && q.y >= 0 && q.x < size.x && q.y < size.y)
+        {
+            vec4 hc = imageLoad(prevcolor, q), ha = imageLoad(prevaux, q);
+            float prevdist = distance(wp.xyz, pc.prevcampos.xyz);
+            if(hc.a > 0.0 && abs(ha.z - prevdist) < 0.02*prevdist + 0.25)
+            {
+                count = min(hc.a + 1.0, pc.params.x);
+                float k = 1.0/count;
+                color = mix(hc.rgb, c, k);
+                m1 = mix(ha.x, l, k);
+                m2 = mix(ha.y, l*l, k);
+            }
+        }
+    }
+    // the spread over time once there is enough of it, the neighbours' until then
+    float variance = count >= 4.0 ? max(m2 - m1*m1, 0.0) : max(spatialvar, max(m2 - m1*m1, 0.0));
+    imageStore(curcolor, p, vec4(color, count));
+    imageStore(curaux, p, vec4(m1, m2, surfdist, 0.0));
+    imageStore(filtered, p, vec4(color, variance));
+}

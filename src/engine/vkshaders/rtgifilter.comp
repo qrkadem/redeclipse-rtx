@@ -1,0 +1,57 @@
+// Ray traced indirect light, filtered over the surface (vkrt.cpp): one step of an edge-avoiding a-trous wavelet, run a
+// few times with the taps twice as far apart each time. Neighbours count by how alike their surface is and by how
+// close their light is to this pixel's, allowing for as much difference as the light's own noise, so the noise goes
+// and the edges between lit and shaded stay.
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;   // rgb light, a variance
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D positions;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D normals;
+
+layout(push_constant) uniform Params
+{
+    vec4 campos; // xyz camera
+    vec4 params; // x pixels between taps, y how much of the noise counts as alike
+} pc;
+
+const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
+const float kernel[3] = float[](3.0/8.0, 1.0/4.0, 1.0/16.0);
+
+void main()
+{
+    ivec2 size = imageSize(positions);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p);
+    if(wp.w <= 0.0)
+    {
+        imageStore(dst, p, vec4(0.0));
+        return;
+    }
+    vec4 centre = imageLoad(src, p);
+    vec3 n = normalize(imageLoad(normals, p).xyz);
+    float l = dot(centre.rgb, lum), sigma = pc.params.y*sqrt(max(centre.a, 0.0)) + 1.0e-3,
+          planescale = 1.0/(0.01*distance(wp.xyz, pc.campos.xyz) + 0.1);
+    int step = int(pc.params.x);
+    vec3 sum = vec3(0.0);
+    float total = 0.0, var = 0.0;
+    for(int y = -2; y <= 2; y++) for(int x = -2; x <= 2; x++)
+    {
+        ivec2 q = p + ivec2(x, y)*step;
+        if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+        vec4 qp = imageLoad(positions, q);
+        if(qp.w <= 0.0) continue;
+        vec4 s = imageLoad(src, q);
+        vec3 qn = normalize(imageLoad(normals, q).xyz);
+        float w = kernel[abs(x)]*kernel[abs(y)] * pow(max(dot(n, qn), 0.0), 64.0) *
+                  exp(-abs(dot(qp.xyz - wp.xyz, n))*planescale - abs(dot(s.rgb, lum) - l)/sigma);
+        sum += s.rgb*w;
+        var += s.a*w*w;
+        total += w;
+    }
+    imageStore(dst, p, total > 0.0 ? vec4(sum/total, var/(total*total)) : centre);
+}

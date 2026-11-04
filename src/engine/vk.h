@@ -66,8 +66,8 @@ extern GLuint vkrt_texture();    // the result for GL's lighting: r ambient occl
 extern void vkrt_trace();        // between the G-buffer and lighting
 extern void vkrt_worldchanged();
 extern void vkrt_newmap();       // a map was loaded: its textures are read again for reflections
-// ray traced reflections, after lighting: a light that can reach what is reflected, laid out as the shader reads it
-struct rtrefllight
+// a light that can reach what rays hit, laid out as the shaders read it
+struct rtlight
 {
     vec o;
     float radius;
@@ -76,8 +76,8 @@ struct rtrefllight
     vec spotdir;   // from the spot's target towards the light
     float spotscale; // 1/(1 - cos of the spot's angle), 0 for a point light
 };
-// how the deferred shading lights the scene, for what is reflected off screen
-struct rtreflshading
+// how the deferred shading lights the scene, for what rays hit off screen
+struct rtshading
 {
     vec ambient, suncolor, sundir, skycolor, fogcolor;
     float glowscale, fogdensity, fogscale;
@@ -85,9 +85,13 @@ struct rtreflshading
 };
 extern float rtreflrough;          // roughness at which traced reflections give way to the environment maps
 extern bool reflectionsenabled();  // renderlights.cpp: the reflection pass runs this frame
+extern void getrtshading(rtshading &s, vector<rtlight> &lights); // renderlights.cpp: the lighting and the lights this frame
 extern bool vkrt_reflavailable();
-// the reflected light, premultiplied by how much of it the rays found (alpha), or 0 when there is none this frame
-extern GLuint vkrt_reflect(GLuint litfbo, int w, int h, const rtreflshading &s, const rtrefllight *lights, int numlights);
+// once the scene is lit: the reflected light, premultiplied by how much of it the rays found (alpha), or 0 when there
+// is none this frame
+extern GLuint vkrt_reflect(GLuint litfbo, int w, int h);
+extern bool vkrt_giavailable();  // ray traced indirect light is wanted and possible: picks the lighting shaders
+extern GLuint vkrt_gitexture();  // the indirect light reaching each pixel, black when none was traced this frame
 extern void vkrt_cleanupgl();
 extern void vkrt_shutdown();
 extern bool vk_hastear();

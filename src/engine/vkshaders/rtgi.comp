@@ -1,0 +1,65 @@
+// Ray traced indirect light (vkrt.cpp): each surface sends a ray in a cosine weighted direction and takes the light
+// coming back along it, that the sun, the map's lights and glowing surfaces put on what it hit, or the open sky's
+// where it hit nothing. The map's ambient light stays as it is, so this is the light bounced on top of it: colour
+// bleeding from lit walls, light reaching around corners, glowing panels lighting what is near them. It is traced at
+// half the resolution, from a different pixel of each two by two block every frame, and brought back up after.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "rtcommon.glsl"
+
+layout(set = 0, binding = 3, rgba32f) uniform writeonly image2D outpos;    // the surface traced from, w 0 for none
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D outcolor;  // the light coming in
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D outnormal;
+
+void main()
+{
+    ivec2 size = imageSize(outcolor);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    uint frame = uint(pc.campos.w);
+    ivec2 fp = min(p*2 + ivec2(frame&1u, (frame>>1)&1u), imageSize(positions) - 1);
+    vec4 wp = imageLoad(positions, fp);
+    imageStore(outpos, p, wp);
+    if(wp.w <= 0.0)
+    {
+        imageStore(outcolor, p, vec4(0.0));
+        imageStore(outnormal, p, vec4(0.0));
+        return;
+    }
+    vec3 n = normalize(imageLoad(normals, fp).xyz);
+    imageStore(outnormal, p, vec4(n, 0.0));
+    float surfdist = distance(wp.xyz, pc.campos.xyz);
+    uint seed = hash(uint(p.x) | (uint(p.y) << 16)) ^ hash(floatBitsToUint(pc.campos.w) + 0x85ebca6bu);
+
+    vec3 t, b;
+    basis(n, t, b);
+    float r1 = rnd(seed), r2 = rnd(seed), r = sqrt(r1), phi = 6.28318531*r2;
+    vec3 d = normalize(t*(r*cos(phi)) + b*(r*sin(phi)) + n*sqrt(max(1.0 - r1, 0.0)));
+    vec3 o = wp.xyz + n*(0.05 + surfdist*0.001);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, scene, gl_RayFlagsOpaqueEXT, 0xFFu, o, 0.0, d, pc.gi.x);
+    while(rayQueryProceedEXT(rq)) {}
+    vec3 light;
+    if(rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+    {
+        // out to the sky, which lights what sees it where the map has sky light; a ray stopped short of it by
+        // distance alone counts as open too, as the ambient stands in for what is far away
+        light = pc.skycolor.w > 0.0 ? pc.skycolor.rgb*pc.gi.z : vec3(0.0);
+    }
+    else
+    {
+        float hitt = rayQueryGetIntersectionTEXT(rq, true);
+        // a diffuse ray's cone is wide, so the texture's lower mips do
+        light = shade(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true), rayQueryGetIntersectionPrimitiveIndexEXT(rq, true),
+            rayQueryGetIntersectionBarycentricsEXT(rq, true), rayQueryGetIntersectionObjectToWorldEXT(rq, true),
+            o + d*hitt, d, hitt, pc.params.z*surfdist, 0.5, false, false, seed);
+    }
+    light *= pc.gi.y;
+    if(any(isnan(light)) || any(isinf(light))) light = vec3(0.0);
+    imageStore(outcolor, p, vec4(min(light, vec3(64.0)), 1.0));
+}

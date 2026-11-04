@@ -24,6 +24,18 @@ static const uint32_t rtrefltemporalspv[] =
 static const uint32_t rtreflfilterspv[] =
 #include "vkshaders/rtreflfilter.spv.h"
 ;
+static const uint32_t rtgispv[] =
+#include "vkshaders/rtgi.spv.h"
+;
+static const uint32_t rtgitemporalspv[] =
+#include "vkshaders/rtgitemporal.spv.h"
+;
+static const uint32_t rtgifilterspv[] =
+#include "vkshaders/rtgifilter.spv.h"
+;
+static const uint32_t rtgiupsamplespv[] =
+#include "vkshaders/rtgiupsample.spv.h"
+;
 
 VARF(IDF_PERSIST, rtao, 0, 1, 1, cleardeferredlightshaders());  // ray traced ambient occlusion, when the card can trace
 VARF(IDF_PERSIST, rtsun, 0, 1, 1, cleardeferredlightshaders()); // ray traced sun shadows, when the card can trace
@@ -39,7 +51,15 @@ FVAR(IDF_PERSIST, rtreflrough, 0.05f, 0.6f, 1);  // roughness at which traced re
 FVAR(IDF_PERSIST, rtrefldist, 64, 8192, 65536);  // farthest a reflection ray looks
 VAR(IDF_PERSIST, rtreflhistory, 1, 32, 128);     // most frames a reflection's rays are averaged over
 VAR(IDF_PERSIST, rtreflfilter, 0, 3, 4);         // spatial filter radius on the roughest traced surfaces, in pixels
-VARF(IDF_PERSIST, rtrefltexsize, 16, 256, 1024, rtreflchanged()); // size of the textures lighting reflected surfaces off screen
+VARF(IDF_PERSIST, rtrefltexsize, 16, 256, 1024, rtreflchanged()); // size of the textures lighting what rays hit off screen
+static void rtgichanged();
+VARF(IDF_PERSIST, rtgi, 0, 1, 1, rtgichanged()); // ray traced indirect light, in place of radiance hints, when the card can trace
+FVAR(IDF_PERSIST, rtgiscale, 0, 1, 4);           // how strong the indirect light is
+FVAR(IDF_PERSIST, rtgisky, 0, 1, 4);             // how strong the open sky's light is in it, where the map has sky light
+FVAR(IDF_PERSIST, rtgidist, 16, 2048, 65536);    // farthest an indirect light ray looks
+VAR(IDF_PERSIST, rtgihistory, 1, 32, 128);       // most frames a surface's indirect light is averaged over
+VAR(IDF_PERSIST, rtgifilter, 0, 3, 5);           // filter passes over the indirect light, each reaching twice as far
+FVAR(IDF_PERSIST, rtgisigma, 0.1f, 4, 64);       // how much of the indirect light's own noise the filter smooths over
 VAR(0, dbgrt, 0, 0, 2);
 VAR(0, dbgrtrefl, 0, 0, 2); // reflections show where they hit what the camera sees (green) and what it doesn't (red), 2 makes every surface a mirror
 
@@ -976,7 +996,7 @@ namespace vk
             memcpy(rtgeombufs[i].mapped, rtgeoms.getbuf(), rtgeoms.length()*sizeof(rtgeometry));
         }
         if(ok) ok = uploadbuffer(rtmatbuf, rtmats);
-        if(ok) ok = updatetextures(cmd, scratch, rtrefl != 0);
+        if(ok) ok = updatetextures(cmd, scratch, rtrefl || rtgi);
         if(ok)
         {
             // the world and map models stay at the start of both copies, animated models go after them each frame
@@ -1293,7 +1313,7 @@ namespace vk
     struct reflparams
     {
         float viewproj[16];
-        float campos[4], sundir[4], suncolor[4], ambient[4], skycolor[4], fogcolor[4], fog[4], params[4];
+        float campos[4], sundir[4], suncolor[4], ambient[4], skycolor[4], fogcolor[4], fog[4], params[4], gi[4];
         VkDeviceAddress geometries, materials;
     };
     struct reflhistparams
@@ -1327,6 +1347,27 @@ namespace vk
     static vec rfprevcam(0, 0, 0);
     static bool rfprevvalid = false, rfloaded = false, rffailed = false, rtinputsready = false;
     static int rfnumlights = 0;
+
+    // indirect light: traced at half resolution with the reflections' trace layout, blended over time and filtered a
+    // few times, ping-ponging between two images, then brought back up to the image GL reads
+    struct gihistparams
+    {
+        float prevclip[16];
+        float campos[4], prevcampos[4], params[4];
+    };
+    static deviceimage giraw, gipos, ginormal, gihist[2], gihistaux[2], gifilt[2];
+    static sharedimage giout;
+    static int giw = 0, gih = 0, gicur = 0; // the full size, the rest is half of it
+    static VkDescriptorSetLayout gitemporalsetlayout = VK_NULL_HANDLE, gifiltersetlayout = VK_NULL_HANDLE, giupsetlayout = VK_NULL_HANDLE;
+    static VkPipelineLayout gitemporallayout = VK_NULL_HANDLE, gifilterlayout = VK_NULL_HANDLE, giuplayout = VK_NULL_HANDLE;
+    static VkPipeline gitracepipe = VK_NULL_HANDLE, gitemporalpipe = VK_NULL_HANDLE, gifilterpipe = VK_NULL_HANDLE, giuppipe = VK_NULL_HANDLE;
+    // the filter from each of the two images to the other, the upsample from either
+    static VkDescriptorSet gitracesets[2], gitemporalsets[2], gifiltersets[2], giupsets[2];
+    static matrix4 giprevclip;
+    static vec giprevcam(0, 0, 0);
+    static bool giprevvalid = false, gifresh = false;
+    static float rtgims = 0;
+    static rtshading rtlastshading; // for rtinfo
 
     static bool makecompute(const uint32_t *code, size_t size, VkPipelineLayout layout, VkPipeline &pipe)
     {
@@ -1388,6 +1429,41 @@ namespace vk
            !makecompute(rtreflfilterspv, sizeof(rtreflfilterspv), rflayouts[RFFILTER], rfpipes[RFFILTER]))
             return false;
 
+        // indirect light: its trace shares the reflections' layout; temporal: positions, rays, history read twice,
+        // history written twice, the filter's input; filter: from, to, positions, normals
+        // upsample: from, to, the half resolution surfaces' positions and normals, the full resolution ones
+        int gicounts[3] = { 7, 4, 6 };
+        VkDescriptorSetLayout *gisetlayouts[3] = { &gitemporalsetlayout, &gifiltersetlayout, &giupsetlayout };
+        VkPipelineLayout *gilayouts[3] = { &gitemporallayout, &gifilterlayout, &giuplayout };
+        loopk(3)
+        {
+            VkDescriptorSetLayoutBinding b[7];
+            memset(b, 0, sizeof(b));
+            loopi(gicounts[k])
+            {
+                b[i].binding = i;
+                b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                b[i].descriptorCount = 1;
+                b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            lci.bindingCount = gicounts[k];
+            lci.pBindings = b;
+            if(vkCreateDescriptorSetLayout(device, &lci, NULL, gisetlayouts[k]) != VK_SUCCESS) return false;
+            VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0, uint32_t(k ? sizeof(reflfilterparams) : sizeof(gihistparams)) };
+            VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            plci.setLayoutCount = 1;
+            plci.pSetLayouts = gisetlayouts[k];
+            plci.pushConstantRangeCount = 1;
+            plci.pPushConstantRanges = &range;
+            if(vkCreatePipelineLayout(device, &plci, NULL, gilayouts[k]) != VK_SUCCESS) return false;
+        }
+        if(!makecompute(rtgispv, sizeof(rtgispv), rflayouts[RFTRACE], gitracepipe) ||
+           !makecompute(rtgitemporalspv, sizeof(rtgitemporalspv), gitemporallayout, gitemporalpipe) ||
+           !makecompute(rtgifilterspv, sizeof(rtgifilterspv), gifilterlayout, gifilterpipe) ||
+           !makecompute(rtgiupsamplespv, sizeof(rtgiupsamplespv), giuplayout, giuppipe))
+            return false;
+
         VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
         sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
@@ -1396,10 +1472,10 @@ namespace vk
         if(vkCreateSampler(device, &sci, NULL, &rtsampler) != VK_SUCCESS) return false;
 
         VkDescriptorPoolSize sizes[5] = {
-            { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2*(5 + 8 + 5) },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 } };
+            { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2*(5 + 8 + 5) + 2*(5 + 7 + 4 + 6) },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 } };
         VkDescriptorPoolCreateInfo dpci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-        dpci.maxSets = 2*NUMRF;
+        dpci.maxSets = 2*NUMRF + 2*4;
         dpci.poolSizeCount = 5;
         dpci.pPoolSizes = sizes;
         if(vkCreateDescriptorPool(device, &dpci, NULL, &rfpool) != VK_SUCCESS) return false;
@@ -1412,6 +1488,23 @@ namespace vk
             dsai.pSetLayouts = setlayouts;
             if(vkAllocateDescriptorSets(device, &dsai, rfsets[k]) != VK_SUCCESS) return false;
         }
+        {
+            VkDescriptorSetLayout setlayouts[8] = { rfsetlayouts[RFTRACE], rfsetlayouts[RFTRACE], gitemporalsetlayout, gitemporalsetlayout,
+                                                    gifiltersetlayout, gifiltersetlayout, giupsetlayout, giupsetlayout };
+            VkDescriptorSet sets[8];
+            VkDescriptorSetAllocateInfo dsai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            dsai.descriptorPool = rfpool;
+            dsai.descriptorSetCount = 8;
+            dsai.pSetLayouts = setlayouts;
+            if(vkAllocateDescriptorSets(device, &dsai, sets) != VK_SUCCESS) return false;
+            loopi(2)
+            {
+                gitracesets[i] = sets[i];
+                gitemporalsets[i] = sets[2 + i];
+                gifiltersets[i] = sets[4 + i];
+                giupsets[i] = sets[6 + i];
+            }
+        }
         loopi(2)
         {
             VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -1423,7 +1516,7 @@ namespace vk
             fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
             if(vkCreateFence(device, &fci, NULL, &rffences[i]) != VK_SUCCESS) return false;
             if(!createbuffer(rfparambufs[i], sizeof(reflparams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true) ||
-               !createbuffer(rflightbufs[i], MAXRTREFLLIGHTS*sizeof(rtrefllight), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
+               !createbuffer(rflightbufs[i], MAXRTREFLLIGHTS*sizeof(rtlight), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
                 return false;
         }
         VkQueryPoolCreateInfo qpci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
@@ -1574,8 +1667,214 @@ namespace vk
         vkUpdateDescriptorSets(device, writes.length(), writes.getbuf(), 0, NULL);
     }
 
+    static void destroygiimages()
+    {
+        if(!giw) return;
+        glFinish();
+        queueidle();
+        destroydeviceimage(giraw);
+        destroydeviceimage(gipos);
+        destroydeviceimage(ginormal);
+        loopi(2)
+        {
+            destroydeviceimage(gihist[i]);
+            destroydeviceimage(gihistaux[i]);
+            destroydeviceimage(gifilt[i]);
+        }
+        destroysharedimage(giout);
+        giw = gih = 0;
+        giprevvalid = gifresh = false;
+    }
+
+    static bool creategiimages(int w, int h)
+    {
+        giw = w;
+        gih = h;
+        int hw = (w+1)/2, hh = (h+1)/2;
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if(!createdeviceimage(giraw, hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage) ||
+           !createdeviceimage(gipos, hw, hh, VK_FORMAT_R32G32B32A32_SFLOAT, usage) ||
+           !createdeviceimage(ginormal, hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage) ||
+           !createsharedimage(giout, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, GL_RGBA16F, GL_TEXTURE_RECTANGLE))
+            return false;
+        loopi(2) if(!createdeviceimage(gihist[i], hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage) ||
+                    !createdeviceimage(gihistaux[i], hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage) ||
+                    !createdeviceimage(gifilt[i], hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage))
+            return false;
+        glBindTexture(GL_TEXTURE_RECTANGLE, giout.gltex);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_RECTANGLE, 0);
+
+        // no history and no light yet, GL holds the result between frames
+        VkCommandBuffer cmd = begincommands();
+        if(!cmd) return false;
+        VkImage cleared[10] = { giraw.image, gipos.image, ginormal.image, gihist[0].image, gihist[1].image, gihistaux[0].image, gihistaux[1].image,
+                                gifilt[0].image, gifilt[1].image, giout.image };
+        VkClearColorValue zero = {{ 0, 0, 0, 0 }};
+        VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        loopi(10)
+        {
+            imagebarrier(cmd, cleared[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            vkCmdClearColorImage(cmd, cleared[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            if(i < 9) imagebarrier(cmd, cleared[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT);
+        }
+        imagebarrier(cmd, giout.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, queuefamily, VK_QUEUE_FAMILY_EXTERNAL);
+        if(!endcommands(cmd)) return false;
+        giprevvalid = false;
+        return true;
+    }
+
+    static VkWriteDescriptorSet &imagewrite(vector<VkWriteDescriptorSet> &writes, VkDescriptorImageInfo *info, VkDescriptorSet set, int binding, VkImageView view)
+    {
+        info->sampler = VK_NULL_HANDLE;
+        info->imageView = view;
+        info->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet &w = writes.add();
+        memset(&w, 0, sizeof(w));
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set;
+        w.dstBinding = binding;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w.pImageInfo = info;
+        return w;
+    }
+
+    // the indirect light passes' descriptors, like writereflsets
+    static void writegisets()
+    {
+        if(!rfloaded || !giw || !rtw || !tlas.as || !rttexview) return;
+        vector<VkWriteDescriptorSet> writes;
+        static VkDescriptorImageInfo imgs[64];
+        int n = 0;
+        VkDescriptorImageInfo texinfo = { rtsampler, rttexview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorBufferInfo bufinfo[2][2];
+        VkWriteDescriptorSetAccelerationStructureKHR aswrite = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+        aswrite.accelerationStructureCount = 1;
+        aswrite.pAccelerationStructures = &tlas.as;
+        loopi(2)
+        {
+            // the trace: scene, the full resolution positions and normals, then the half resolution surfaces traced
+            // from and the rays' light
+            VkImageView traceviews[5] = { rtpos.view, rtnormal.view, gipos.view, giraw.view, ginormal.view };
+            loopj(5) imagewrite(writes, &imgs[n++], gitracesets[i], 1 + j, traceviews[j]);
+            VkWriteDescriptorSet &as = writes.add();
+            memset(&as, 0, sizeof(as));
+            as.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            as.pNext = &aswrite;
+            as.dstSet = gitracesets[i];
+            as.dstBinding = 0;
+            as.descriptorCount = 1;
+            as.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            VkWriteDescriptorSet &tex = writes.add();
+            memset(&tex, 0, sizeof(tex));
+            tex.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            tex.dstSet = gitracesets[i];
+            tex.dstBinding = 6;
+            tex.descriptorCount = 1;
+            tex.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            tex.pImageInfo = &texinfo;
+            bufinfo[i][0] = { rfparambufs[i].buf, 0, VK_WHOLE_SIZE };
+            bufinfo[i][1] = { rflightbufs[i].buf, 0, VK_WHOLE_SIZE };
+            loopj(2)
+            {
+                VkWriteDescriptorSet &b = writes.add();
+                memset(&b, 0, sizeof(b));
+                b.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                b.dstSet = gitracesets[i];
+                b.dstBinding = 7 + j;
+                b.descriptorCount = 1;
+                b.descriptorType = j ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                b.pBufferInfo = &bufinfo[i][j];
+            }
+            // over time: writes history i and reads the other
+            VkImageView temporalviews[7] = { gipos.view, giraw.view, gihist[1-i].view, gihistaux[1-i].view, gihist[i].view, gihistaux[i].view, gifilt[0].view };
+            loopj(7) imagewrite(writes, &imgs[n++], gitemporalsets[i], j, temporalviews[j]);
+            // filtering from image i to the other, bringing image i up
+            VkImageView filterviews[4] = { gifilt[i].view, gifilt[1-i].view, gipos.view, ginormal.view };
+            loopj(4) imagewrite(writes, &imgs[n++], gifiltersets[i], j, filterviews[j]);
+            VkImageView upviews[6] = { gifilt[i].view, giout.view, gipos.view, ginormal.view, rtpos.view, rtnormal.view };
+            loopj(6) imagewrite(writes, &imgs[n++], giupsets[i], j, upviews[j]);
+        }
+        vkUpdateDescriptorSets(device, writes.length(), writes.getbuf(), 0, NULL);
+    }
+
+    // the lighting and lights both ray traced passes that light hits read, for this frame's slot
+    static void fillshading(int slot, const rtshading &s, const vector<rtlight> &lights)
+    {
+        rtlastshading = s;
+        rtlight *dst = (rtlight *)rflightbufs[slot].mapped;
+        rfnumlights = 0;
+        if(lights.length() <= MAXRTREFLLIGHTS)
+        {
+            memcpy(dst, lights.getbuf(), lights.length()*sizeof(rtlight));
+            rfnumlights = lights.length();
+        }
+        else
+        {
+            // the nearest when there are too many
+            struct lightorder
+            {
+                float dist;
+                int index;
+                bool operator<(const lightorder &o) const { return dist < o.dist; }
+            };
+            static vector<lightorder> order;
+            order.setsize(0);
+            loopv(lights)
+            {
+                lightorder &l = order.add();
+                l.dist = lights[i].o.dist(viewpos) - lights[i].radius;
+                l.index = i;
+            }
+            order.sort();
+            loopi(MAXRTREFLLIGHTS) dst[i] = lights[order[i].index];
+            rfnumlights = MAXRTREFLLIGHTS;
+        }
+
+        matrix4 vp;
+        vp.muld(viewproj, viewcam);
+        reflparams &rp = *(reflparams *)rfparambufs[slot].mapped;
+        memcpy(rp.viewproj, vp.a.v, sizeof(rp.viewproj));
+        rp.campos[0] = viewpos.x; rp.campos[1] = viewpos.y; rp.campos[2] = viewpos.z; rp.campos[3] = float(rtframe & 0xFFFF);
+        rp.sundir[0] = s.sundir.x; rp.sundir[1] = s.sundir.y; rp.sundir[2] = s.sundir.z; rp.sundir[3] = s.sun ? tanf(rtsunsize*RAD) : -1.0f;
+        rp.suncolor[0] = s.suncolor.x; rp.suncolor[1] = s.suncolor.y; rp.suncolor[2] = s.suncolor.z; rp.suncolor[3] = 0;
+        rp.ambient[0] = s.ambient.x; rp.ambient[1] = s.ambient.y; rp.ambient[2] = s.ambient.z; rp.ambient[3] = s.glowscale;
+        rp.skycolor[0] = s.skycolor.x; rp.skycolor[1] = s.skycolor.y; rp.skycolor[2] = s.skycolor.z; rp.skycolor[3] = s.skycolor.iszero() ? 0 : 1;
+        rp.fogcolor[0] = s.fogcolor.x; rp.fogcolor[1] = s.fogcolor.y; rp.fogcolor[2] = s.fogcolor.z; rp.fogcolor[3] = 0;
+        rp.fog[0] = s.fogdensity; rp.fog[1] = s.fogscale; rp.fog[2] = dbgrtrefl; rp.fog[3] = rfnumlights;
+        rp.params[0] = rtreflrough;
+        rp.params[1] = rtrefldist;
+        rp.params[2] = 2*tanf(fovy*0.5f*RAD)/max(rth, 1);
+        rp.params[3] = rttexdim;
+        rp.gi[0] = rtgidist;
+        rp.gi[1] = rtgiscale;
+        rp.gi[2] = rtgisky;
+        rp.gi[3] = 0;
+        rp.geometries = rtgeombufs[slot].addr;
+        rp.materials = rtmatbuf.addr;
+    }
+
     static void destroyrefl()
     {
+        destroygiimages();
+        if(gitracepipe) vkDestroyPipeline(device, gitracepipe, NULL);
+        if(gitemporalpipe) vkDestroyPipeline(device, gitemporalpipe, NULL);
+        if(gifilterpipe) vkDestroyPipeline(device, gifilterpipe, NULL);
+        if(giuppipe) vkDestroyPipeline(device, giuppipe, NULL);
+        if(gitemporallayout) vkDestroyPipelineLayout(device, gitemporallayout, NULL);
+        if(gifilterlayout) vkDestroyPipelineLayout(device, gifilterlayout, NULL);
+        if(giuplayout) vkDestroyPipelineLayout(device, giuplayout, NULL);
+        if(gitemporalsetlayout) vkDestroyDescriptorSetLayout(device, gitemporalsetlayout, NULL);
+        if(gifiltersetlayout) vkDestroyDescriptorSetLayout(device, gifiltersetlayout, NULL);
+        if(giupsetlayout) vkDestroyDescriptorSetLayout(device, giupsetlayout, NULL);
+        gitracepipe = gitemporalpipe = gifilterpipe = giuppipe = VK_NULL_HANDLE;
+        gitemporallayout = gifilterlayout = giuplayout = VK_NULL_HANDLE;
+        gitemporalsetlayout = gifiltersetlayout = giupsetlayout = VK_NULL_HANDLE;
         destroyreflimages();
         loopi(2)
         {
@@ -1608,7 +1907,8 @@ namespace vk
 
 using namespace vk;
 
-static string rtdumpname = "", rfdumpname = "";
+static string rtdumpname = "", rfdumpname = "", gidumpname = "";
+ICOMMAND(0, rtgidump, "s", (char *name), copystring(gidumpname, *name ? name : "rtgidump"));
 ICOMMAND(0, rtdump, "s", (char *name), copystring(rtdumpname, *name ? name : "rtdump"));
 ICOMMAND(0, rtrefldump, "s", (char *name), copystring(rfdumpname, *name ? name : "rtrefldump"));
 
@@ -1624,6 +1924,32 @@ static void rtreflchanged()
 void vkrt_newmap() { rtnewmap = true; }
 
 bool vkrt_reflavailable() { return rtrefl && vkactive && hasrt && !rtfailed && !rffailed; }
+bool vkrt_giavailable() { return rtgi && vkactive && hasrt && !rtfailed && !rffailed; }
+
+// the lighting shaders change with it, and the scene needs its textures to light what the rays hit
+static void rtgichanged()
+{
+    cleardeferredlightshaders();
+    if(rtgi) worlddirty = true;
+}
+
+static GLuint rtblacktex = 0;
+GLuint vkrt_gitexture()
+{
+    if(gifresh && giout.gltex) return giout.gltex;
+    if(!rtblacktex)
+    {
+        static const ushort black[4] = { 0, 0, 0, 0 };
+        glGenTextures(1, &rtblacktex);
+        glBindTexture(GL_TEXTURE_RECTANGLE, rtblacktex);
+        glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_HALF_FLOAT, black);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    return rtblacktex;
+}
 
 bool vkrt_aoavailable() { return rtao && vkactive && hasrt && !rtfailed; }
 bool vkrt_sunavailable() { return rtsun && vkactive && hasrt && !rtfailed; }
@@ -1654,7 +1980,7 @@ matrix4 vkrt_partworld;
 
 bool vkrt_capturing()
 {
-    return rtcapturewindow && !rtcapturepaused && !drawtex && rtplayers && vkactive && hasrt && !rtfailed && (rtao || rtsun || rtrefl);
+    return rtcapturewindow && !rtcapturepaused && !drawtex && rtplayers && vkactive && hasrt && !rtfailed && (rtao || rtsun || rtrefl || rtgi);
 }
 
 bool vkrt_playershadows() { return rtplayers && vkrt_sunready(); }
@@ -1708,7 +2034,10 @@ void vkrt_cleanupgl()
 {
     if(rtwhitetex) glDeleteTextures(1, &rtwhitetex);
     rtwhitetex = 0;
+    if(rtblacktex) glDeleteTextures(1, &rtblacktex);
+    rtblacktex = 0;
     if(!device) return;
+    destroygiimages();
     destroyreflimages();
     destroyrtimages();
     rtfresh = false;
@@ -1763,12 +2092,14 @@ void vkrt_trace()
     rtfresh = false;
     rtinputsready = false;
     rtcapturewindow = false; // what was drawn so far this frame is what goes in the scene
-    bool doao = vkrt_aoavailable(), dosun = vkrt_sunavailable() && !getpielight().iszero(), dorefl = vkrt_reflavailable() && reflectionsenabled();
-    if((!doao && !dosun && !dorefl) || drawtex || !loadrt()) return;
-    if(dorefl && !loadrefl())
+    gifresh = false;
+    bool doao = vkrt_aoavailable(), dosun = vkrt_sunavailable() && !getpielight().iszero(), dorefl = vkrt_reflavailable() && reflectionsenabled(),
+         dogi = vkrt_giavailable();
+    if((!doao && !dosun && !dorefl && !dogi) || drawtex || !loadrt()) return;
+    if((dorefl || dogi) && !loadrefl())
     {
-        conoutf(colourred, "Ray tracing: could not set up reflections");
-        dorefl = false;
+        conoutf(colourred, "Ray tracing: could not set up reflections and indirect light");
+        dorefl = dogi = false;
         if(!doao && !dosun) return;
     }
     // editing changes the world piece by piece, so it is rebuilt a few times a second at most
@@ -1780,6 +2111,7 @@ void vkrt_trace()
         {
             updatescene();
             writereflsets();
+            writegisets();
         }
         if(!haveworld && had) rtprevvalid = false;
     }
@@ -1794,6 +2126,18 @@ void vkrt_trace()
             rtfailed = true;
             return;
         }
+    }
+    if(dogi && (giw != gw || gih != gh))
+    {
+        destroygiimages();
+        if(!creategiimages(gw, gh))
+        {
+            conoutf(colourred, "Ray tracing: could not make the %dx%d indirect light images", gw, gh);
+            destroygiimages();
+            rffailed = true;
+            return;
+        }
+        writegisets();
     }
     Shader *inputshader = useshaderbyname("rtinputs"), *clearshader = useshaderbyname("rtclearavatar");
     if(!inputshader || !clearshader) return;
@@ -1850,9 +2194,11 @@ void vkrt_trace()
     glBindFramebuffer_(GL_FRAMEBUFFER, oldfbo);
     glViewport(oldviewport[0], oldviewport[1], oldviewport[2], oldviewport[3]);
 
-    GLuint texs[3] = { rtpos.gltex, rtnormal.gltex, rtresult.gltex };
-    GLenum layouts[3] = { GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT };
-    glsignal(rtready, 3, texs, layouts);
+    // the indirect light's image goes back and forth with the rest once there is one
+    int numtexs = giw ? 4 : 3;
+    GLuint texs[4] = { rtpos.gltex, rtnormal.gltex, rtresult.gltex, giout.gltex };
+    GLenum layouts[4] = { GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT };
+    glsignal(rtready, numtexs, texs, layouts);
     glFlush();
 
     matrix4 vp;
@@ -1874,17 +2220,18 @@ void vkrt_trace()
     {
         VkQueryPoolCreateInfo qpci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qpci.queryCount = 6;
+        qpci.queryCount = 8;
         vkCreateQueryPool(device, &qpci, NULL, &rtqueries);
     }
     if(rtqueries && rtqueried[slot])
     {
-        uint64_t stamps[3];
-        if(vkGetQueryPoolResults(device, rtqueries, slot*3, 3, sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        uint64_t stamps[4];
+        if(vkGetQueryPoolResults(device, rtqueries, slot*4, 4, sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
         {
             float tick = devprops.limits.timestampPeriod*1e-6f;
             rtscenems += ((stamps[1]-stamps[0])*tick - rtscenems)*0.05f;
             rttracems += ((stamps[2]-stamps[1])*tick - rttracems)*0.05f;
+            rtgims += ((stamps[3]-stamps[2])*tick - rtgims)*0.05f;
         }
     }
     // parts not drawn for a while go, once in a while, as that waits for the queue
@@ -1913,13 +2260,21 @@ void vkrt_trace()
     vkBeginCommandBuffer(cmd, &bi);
     if(rtqueries)
     {
-        vkCmdResetQueryPool(cmd, rtqueries, slot*3, 3);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, rtqueries, slot*3);
+        vkCmdResetQueryPool(cmd, rtqueries, slot*4, 4);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, rtqueries, slot*4);
+    }
+    // how the scene is lit, for what reflections and indirect light rays hit
+    if(dorefl || dogi)
+    {
+        static rtshading shading;
+        static vector<rtlight> lights;
+        getrtshading(shading, lights);
+        fillshading(slot, shading, lights);
     }
     buildscene(cmd, slot);
-    if(rtqueries) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rtqueries, slot*3+1);
-    sharedimage *shared[3] = { &rtpos, &rtnormal, &rtresult };
-    loopi(3) imagebarrier(cmd, shared[i]->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+    if(rtqueries) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rtqueries, slot*4+1);
+    sharedimage *shared[4] = { &rtpos, &rtnormal, &rtresult, &giout };
+    loopi(numtexs) imagebarrier(cmd, shared[i]->image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT,
         VK_QUEUE_FAMILY_EXTERNAL, queuefamily);
 
@@ -1951,12 +2306,58 @@ void vkrt_trace()
         vkCmdDispatch(cmd, (gw+7)/8, (gh+7)/8, 1);
     }
 
+    if(rtqueries) vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rtqueries, slot*4+2);
+
+    if(dogi)
+    {
+        // a ray each at half resolution, then over time, then filtered, then brought up to what GL reads
+        uint32_t gx = ((gw+1)/2+7)/8, gy = ((gh+1)/2+7)/8;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gitracepipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rflayouts[RFTRACE], 0, 1, &gitracesets[slot], 0, NULL);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        asbarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT);
+
+        bool history = giprevvalid && giprevcam.dist(viewpos) <= 64;
+        gihistparams hp;
+        memcpy(hp.prevclip, (history ? giprevclip : vp).a.v, sizeof(hp.prevclip));
+        vec prevcam = history ? giprevcam : viewpos;
+        hp.campos[0] = viewpos.x; hp.campos[1] = viewpos.y; hp.campos[2] = viewpos.z; hp.campos[3] = 0;
+        hp.prevcampos[0] = prevcam.x; hp.prevcampos[1] = prevcam.y; hp.prevcampos[2] = prevcam.z; hp.prevcampos[3] = 0;
+        hp.params[0] = history ? rtgihistory : 1;
+        hp.params[1] = hp.params[2] = hp.params[3] = 0;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gitemporalpipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gitemporallayout, 0, 1, &gitemporalsets[gicur], 0, NULL);
+        vkCmdPushConstants(cmd, gitemporallayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hp), &hp);
+        vkCmdDispatch(cmd, gx, gy, 1);
+
+        reflfilterparams fp;
+        fp.campos[0] = viewpos.x; fp.campos[1] = viewpos.y; fp.campos[2] = viewpos.z; fp.campos[3] = 0;
+        fp.params[1] = rtgisigma;
+        fp.params[2] = fp.params[3] = 0;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gifilterpipe);
+        int from = 0;
+        loopi(rtgifilter)
+        {
+            asbarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT);
+            fp.params[0] = float(1<<i);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gifilterlayout, 0, 1, &gifiltersets[from], 0, NULL);
+            vkCmdPushConstants(cmd, gifilterlayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fp), &fp);
+            vkCmdDispatch(cmd, gx, gy, 1);
+            from ^= 1;
+        }
+        asbarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, giuppipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, giuplayout, 0, 1, &giupsets[from], 0, NULL);
+        vkCmdPushConstants(cmd, giuplayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fp), &fp);
+        vkCmdDispatch(cmd, (gw+7)/8, (gh+7)/8, 1);
+    }
+
     if(rtqueries)
     {
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rtqueries, slot*3+2);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rtqueries, slot*4+3);
         rtqueried[slot] = true;
     }
-    loopi(3) imagebarrier(cmd, shared[i]->image, VK_IMAGE_LAYOUT_GENERAL, i == 2 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+    loopi(numtexs) imagebarrier(cmd, shared[i]->image, VK_IMAGE_LAYOUT_GENERAL, i >= 2 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT|VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         queuefamily, VK_QUEUE_FAMILY_EXTERNAL);
     vkEndCommandBuffer(cmd);
@@ -1982,8 +2383,24 @@ void vkrt_trace()
         rtfailed = true;
         return;
     }
-    GLenum backlayouts[3] = { GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_SHADER_READ_ONLY_EXT };
-    glwait(rtdone, 3, texs, backlayouts);
+    GLenum backlayouts[4] = { GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_SHADER_READ_ONLY_EXT, GL_LAYOUT_SHADER_READ_ONLY_EXT };
+    glwait(rtdone, numtexs, texs, backlayouts);
+
+    if(gidumpname[0] && dogi)
+    {
+        // development aid: the indirect light reaching each pixel, twice as bright so the dim parts show
+        float *light = new float[giw*gih*4];
+        glBindTexture(GL_TEXTURE_RECTANGLE, giout.gltex);
+        glGetTexImage(GL_TEXTURE_RECTANGLE, 0, GL_RGBA, GL_FLOAT, light);
+        glBindTexture(GL_TEXTURE_RECTANGLE, 0);
+        ImageData img(giw, gih, 3);
+        loopi(giw*gih) loopk(3) img.data[i*3+k] = uchar(clamp(light[i*4+k]*2, 0.0f, 1.0f)*255);
+        defformatstring(name, "%s.png", gidumpname);
+        saveimage(name, img, IFMT_PNG, 9, true);
+        conoutf(colourwhite, "Ray tracing: saved %s (indirect light, twice as bright)", name);
+        delete[] light;
+        gidumpname[0] = '\0';
+    }
 
     if(rtdumpname[0])
     {
@@ -2018,13 +2435,22 @@ void vkrt_trace()
         rtfresh = true;
     }
     else rtprevvalid = false;
+    if(dogi)
+    {
+        giprevclip = vp;
+        giprevcam = viewpos;
+        giprevvalid = true;
+        gicur ^= 1;
+        gifresh = true;
+    }
+    else giprevvalid = false;
     rtgeomslot = slot;
     rtinputsready = dorefl;
     rtframe++; // the rays' random numbers change every frame, for whichever pass traces
 }
 
 // once GL has lit the scene: what each surface reflects, for GL to add to it
-GLuint vkrt_reflect(GLuint litfbo, int w, int h, const rtreflshading &s, const rtrefllight *lights, int numlights)
+GLuint vkrt_reflect(GLuint litfbo, int w, int h)
 {
     if(!rtinputsready || !haveworld || !rfloaded || !rttexview) return 0;
     rtinputsready = false;
@@ -2064,52 +2490,9 @@ GLuint vkrt_reflect(GLuint litfbo, int w, int h, const rtreflshading &s, const r
             rfms += ((stamps[1]-stamps[0])*devprops.limits.timestampPeriod*1e-6f - rfms)*0.05f;
     }
 
-    // the lights that can reach what is reflected, the nearest when there are too many
-    rtrefllight *dst = (rtrefllight *)rflightbufs[slot].mapped;
-    rfnumlights = 0;
-    if(numlights <= MAXRTREFLLIGHTS)
-    {
-        memcpy(dst, lights, numlights*sizeof(rtrefllight));
-        rfnumlights = numlights;
-    }
-    else
-    {
-        struct lightorder
-        {
-            float dist;
-            int index;
-            bool operator<(const lightorder &o) const { return dist < o.dist; }
-        };
-        static vector<lightorder> order;
-        order.setsize(0);
-        loopi(numlights)
-        {
-            lightorder &l = order.add();
-            l.dist = lights[i].o.dist(viewpos) - lights[i].radius;
-            l.index = i;
-        }
-        order.sort();
-        loopi(MAXRTREFLLIGHTS) dst[i] = lights[order[i].index];
-        rfnumlights = MAXRTREFLLIGHTS;
-    }
-
+    // the lighting and lights were filled in before lighting, by vkrt_trace
     matrix4 vp;
     vp.muld(viewproj, viewcam);
-    reflparams &rp = *(reflparams *)rfparambufs[slot].mapped;
-    memcpy(rp.viewproj, vp.a.v, sizeof(rp.viewproj));
-    rp.campos[0] = viewpos.x; rp.campos[1] = viewpos.y; rp.campos[2] = viewpos.z; rp.campos[3] = float(rtframe & 0xFFFF);
-    rp.sundir[0] = s.sundir.x; rp.sundir[1] = s.sundir.y; rp.sundir[2] = s.sundir.z; rp.sundir[3] = s.sun ? tanf(rtsunsize*RAD) : -1.0f;
-    rp.suncolor[0] = s.suncolor.x; rp.suncolor[1] = s.suncolor.y; rp.suncolor[2] = s.suncolor.z; rp.suncolor[3] = 0;
-    rp.ambient[0] = s.ambient.x; rp.ambient[1] = s.ambient.y; rp.ambient[2] = s.ambient.z; rp.ambient[3] = s.glowscale;
-    rp.skycolor[0] = s.skycolor.x; rp.skycolor[1] = s.skycolor.y; rp.skycolor[2] = s.skycolor.z; rp.skycolor[3] = s.skycolor.iszero() ? 0 : 1;
-    rp.fogcolor[0] = s.fogcolor.x; rp.fogcolor[1] = s.fogcolor.y; rp.fogcolor[2] = s.fogcolor.z; rp.fogcolor[3] = 0;
-    rp.fog[0] = s.fogdensity; rp.fog[1] = s.fogscale; rp.fog[2] = dbgrtrefl; rp.fog[3] = rfnumlights;
-    rp.params[0] = rtreflrough;
-    rp.params[1] = rtrefldist;
-    rp.params[2] = 2*tanf(fovy*0.5f*RAD)/max(rfh, 1);
-    rp.params[3] = rttexdim;
-    rp.geometries = rtgeombufs[slot].addr;
-    rp.materials = rtmatbuf.addr;
 
     // a camera that jumped has nothing to reproject
     bool history = rfprevvalid && rfprevcam.dist(viewpos) <= 64;
@@ -2237,7 +2620,11 @@ ICOMMAND(0, rtinfo, "", (),
 {
     if(!vkactive || !hasrt) { conoutf(colourwhite, "Ray tracing: not available"); return; }
     const vec &sundir = getpielightdir();
-    conoutf(colourwhite, "Ray tracing: GPU %.2f ms building the scene, %.2f ms tracing and filtering, %.2f ms reflections", rtscenems, rttracems, rfms);
+    conoutf(colourwhite, "Ray tracing: GPU %.2f ms building the scene, %.2f ms ambient occlusion and sun, %.2f ms indirect light, %.2f ms reflections", rtscenems, rttracems, rtgims, rfms);
+    conoutf(colourwhite, "Ray tracing: indirect light %s", vkrt_giavailable() ? "on" : "off");
+    const rtshading &l = rtlastshading;
+    conoutf(colourwhite, "Ray tracing: lighting ambient %.3f %.3f %.3f, sun %.3f %.3f %.3f%s, sky %.3f %.3f %.3f, glow %.3f", l.ambient.x, l.ambient.y, l.ambient.z,
+        l.suncolor.x, l.suncolor.y, l.suncolor.z, l.sun ? "" : " (none)", l.skycolor.x, l.skycolor.y, l.skycolor.z, l.glowscale);
     conoutf(colourwhite, "Ray tracing: reflections %s, %d materials, %d textures of %dx%d (%d uploaded), %d lights", vkrt_reflavailable() ? "on" : "off", rtmats.length(), rtlayers.length(), rttexdim, rttexdim, rtlayersuploaded, rfnumlights);
     conoutf(colourwhite, "Ray tracing: world %d triangles, %d map models of %d triangles, %d animated parts this frame, images %dx%d, ao %s, sun %s (towards %.2f %.2f %.2f%s)%s", worldtris, modelinstances, modeltris, rtskinnedcount, rtw, rth,
         vkrt_aoavailable() ? "on" : "off", vkrt_sunavailable() ? "on" : "off", sundir.x, sundir.y, sundir.z, getpielight().iszero() ? ", no sunlight" : "", rtfailed ? ", failed" : "");
