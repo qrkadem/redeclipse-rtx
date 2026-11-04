@@ -2639,10 +2639,13 @@ void radiancehints::bindparams()
     GLOBALPARAMF(rhbounds, 0.5f*(rhgrid + rhborder)/float(rhgrid + 2*rhborder));
 }
 
+// under ray traced indirect light the radiance hints are kept for the sky's light alone, as the maps were lit with it,
+// unless the sky is traced too
+static inline bool rhskyonly() { return vkrt_giavailable() && !vkrt_giskytraced(); }
+
 bool useradiancehints()
 {
-    // ray traced indirect light has the sun's bounce and the sky in it
-    return !worldcols[WORLDCOL_F_SUNLIGHT].iszero() && csmshadowmap && gi && getgiscale() && getgidist() && !vkrt_giavailable();
+    return !worldcols[WORLDCOL_F_SUNLIGHT].iszero() && csmshadowmap && gi && getgiscale() && getgidist() && (!vkrt_giavailable() || rhskyonly());
 }
 
 // UI viewports go without GI, it costs as much as the rest of their lighting and moves the main view's cached GI
@@ -2862,7 +2865,7 @@ Shader *loaddeferredlightshader(const char *type = NULL, bool nogi = false)
         {
             if(avatar && aoon() && getaosun()) sun[sunlen++] = 'A';
             if(vkrt_sunavailable()) sun[sunlen++] = 'T';
-            if(!nogi && gi && getgiscale() && getgidist() && !vkrt_giavailable())
+            if(!nogi && gi && getgiscale() && getgidist() && (!vkrt_giavailable() || rhskyonly()))
             {
                 userh = rhsplits;
                 sun[sunlen++] = 'r';
@@ -5622,12 +5625,13 @@ void getrtshading(rtshading &s, vector<rtlight> &rl)
     s.sun = !pie.iszero() && getpielightscale() > 0;
     s.suncolor = vec(pie.x, pie.y, pie.z).mul(lightscale*getpielightscale());
     s.sundir = getpielightdir();
-    // the open sky lights through GI, where the map has it: the radiance hints give a surface open to the whole sky
-    // about 0.4 of their sky light colour, so a ray reaching the sky brings that much
-    if(s.sun && csmshadowmap && gi && getgiscale() && getgidist())
+    // the open sky lights through GI where the map has it, traced when asked for (otherwise the radiance hints light
+    // with it): they give ground open to the sky at most about 0.24 of their sky light colour, under a sun overhead,
+    // so a ray reaching the sky brings that much
+    if(s.sun && csmshadowmap && gi && getgiscale() && getgidist() && vkrt_giskytraced())
     {
         bvec piesky = getskylight();
-        s.skycolor = vec(piesky.x, piesky.y, piesky.z).mul(0.4f*2*getgiaoscale()*lightscale*getskylightscale());
+        s.skycolor = vec(piesky.x, piesky.y, piesky.z).mul(0.24f*2*getgiaoscale()*lightscale*getskylightscale());
     }
     else s.skycolor = vec(0, 0, 0);
     s.fogcolor = curfogcolor;

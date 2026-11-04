@@ -102,6 +102,7 @@ extern bool vkrt_reflavailable();
 // once the scene is lit: the reflected light, premultiplied by how much of it the rays found (alpha), or 0 when there
 // is none this frame
 extern GLuint vkrt_reflect(GLuint litfbo, int w, int h);
+extern bool vkrt_giskytraced(); // the sky's light is in the traced indirect light, not the radiance hints'
 extern bool vkrt_giavailable();  // ray traced indirect light is wanted and possible: picks the lighting shaders
 extern GLuint vkrt_gitexture();  // the indirect light reaching each pixel, black when none was traced this frame
 extern void vkrt_cleanupgl();

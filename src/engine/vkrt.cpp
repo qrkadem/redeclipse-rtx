@@ -55,7 +55,11 @@ VARF(IDF_PERSIST, rtrefltexsize, 16, 256, 1024, rtreflchanged()); // size of the
 static void rtgichanged();
 VARF(IDF_PERSIST, rtgi, 0, 1, 1, rtgichanged()); // ray traced indirect light, in place of radiance hints, when the card can trace
 FVAR(IDF_PERSIST, rtgiscale, 0, 1, 4);           // how strong the indirect light is
-FVAR(IDF_PERSIST, rtgisky, 0, 1, 4);             // how strong the open sky's light is in it, where the map has sky light
+// the open sky's light: by default the radiance hints keep lighting with it as the maps were made, the rays only bounce
+// light; traced, it is shut out exactly by what is overhead, but maps were lit for the radiance hints' sky, which
+// reaches no shade of the sun and is far weaker under a low sun, so traced sky floods shade on maps like octavus
+VARF(IDF_PERSIST, rtgiskytrace, 0, 0, 1, rtgichanged());
+FVAR(IDF_PERSIST, rtgisky, 0, 1, 4);             // how strong the traced sky's light is
 FVAR(IDF_PERSIST, rtgidist, 16, 2048, 65536);    // farthest an indirect light ray looks
 VAR(IDF_PERSIST, rtgihistory, 1, 32, 128);       // most frames a surface's indirect light is averaged over
 VAR(IDF_PERSIST, rtgifilter, 0, 3, 5);           // filter passes over the indirect light, each reaching twice as far
@@ -1938,6 +1942,7 @@ void vkrt_newmap() { rtnewmap = true; }
 
 bool vkrt_reflavailable() { return rtrefl && vkactive && hasrt && !rtfailed && !rffailed; }
 bool vkrt_giavailable() { return rtgi && vkactive && hasrt && !rtfailed && !rffailed; }
+bool vkrt_giskytraced() { return rtgiskytrace != 0; }
 
 // the lighting shaders change with it, and the scene needs its textures to light what the rays hit
 static void rtgichanged()
