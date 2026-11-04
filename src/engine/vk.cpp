@@ -1671,6 +1671,7 @@ namespace vk
     {
         const void *owner, *part;
         matrix4 cur, prev;
+        matrix4 curvp, prevvp; // the first person model's own projection and camera, this frame and last
         int frame;
     };
     static vector<partmotion> partmotions;
@@ -1891,29 +1892,43 @@ void vk_snapshotview()
 
 // a model part's placement this frame and last, as clip space matrices for the velocity target; parts of no entity
 // only move with the camera
+// the first person model is drawn with a projection of its own and moves with the camera, swaying behind it: its
+// motion is from where it was on screen through last frame's projection and camera to this frame's
+static bool avatarmotion = false;
+static int avatarpass = 0;
+void vk_avatarmotion(bool on) { avatarmotion = on; avatarpass = 0; }
+// the arms and weapon, then the body, each with its projection: the same model's parts drawn in each keep apart
+void vk_avatarpass() { if(avatarmotion) avatarpass++; }
+
 void vk_partmotion(const void *owner, const void *part, const matrix4 &world, matrix4 &cur, matrix4 &prev)
 {
-    cur.mul(velcurvp, world);
-    if(!owner) { prev.mul(velprevvp, world); return; }
+    if(avatarmotion && owner) owner = (const char *)owner + 1 + avatarpass;
+    const matrix4 &vp = avatarmotion ? camprojmatrix : velcurvp;
+    cur.mul(vp, world);
+    if(!owner) { prev.mul(avatarmotion ? vp : velprevvp, world); return; }
     loopv(partmotions)
     {
         partmotion &p = partmotions[i];
         if(p.owner != owner || p.part != part) continue;
         if(p.frame != motionframe)
         {
-            p.prev = p.frame == motionframe-1 ? p.cur : world;
+            bool last = p.frame == motionframe-1;
+            p.prev = last ? p.cur : world;
+            p.prevvp = last ? p.curvp : vp;
             p.cur = world;
+            p.curvp = vp;
             p.frame = motionframe;
         }
-        prev.mul(velprevvp, p.prev);
+        prev.mul(avatarmotion ? p.prevvp : velprevvp, p.prev);
         return;
     }
     partmotion &p = partmotions.add();
     p.owner = owner;
     p.part = part;
     p.cur = p.prev = world;
+    p.curvp = p.prevvp = vp;
     p.frame = motionframe;
-    prev.mul(velprevvp, world);
+    prev.mul(avatarmotion ? vp : velprevvp, world);
 }
 
 // motion to where each pixel was the frame before, in pixels, and depth as the depth buffer holds it, from the main
@@ -1949,9 +1964,10 @@ bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, const matri
     else glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
     screenquad(w, h);
     glstencilstate oldstencil;
-    if(stencil)
+    if(stencil && !gvelocity)
     {
-        // the first person model moves with the camera, so on screen it holds still
+        // without models' own motion, the first person model is taken to hold still on screen, as it moves with the
+        // camera; with it, it has its own, sway and all
         oldstencil.save();
         bindgdepth(); // only for its stencil, which marks the first person model
         glDrawBuffers_(1, drawbufs);

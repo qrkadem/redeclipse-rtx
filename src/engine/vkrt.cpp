@@ -62,9 +62,10 @@ VAR(IDF_PERSIST, rtgifilter, 0, 3, 5);           // filter passes over the indir
 FVAR(IDF_PERSIST, rtgisigma, 0.1f, 4, 64);       // how much of the indirect light's own noise the filter smooths over
 VAR(0, dbgrt, 0, 0, 2);
 // with DLSS ray reconstruction, which denoises the rays itself and wants each frame's own noise, not noise held over
-// from the frames before (it keeps that as detail): 0 keeps the rays' own filters, 1 leaves reflections
-// raw and indirect light unfiltered (but gathered over time, as it is traced at half resolution), 2 leaves both raw
-VAR(IDF_PERSIST, dlssrrraw, 0, 2, 2);
+// from the frames before (it keeps that as detail): 0 keeps the rays' own filters, 1 leaves reflections raw and keeps
+// filtering indirect light, 2 leaves both raw. Indirect light is traced at half resolution: raw, its rare bright rays
+// (a glowing strip one ray in many finds) come up to the screen as specks too big for DLSS to tell from detail
+VAR(IDF_PERSIST, dlssrrraw, 0, 1, 2);
 VAR(0, dbgrtrefl, 0, 0, 2); // reflections show where they hit what the camera sees (green) and what it doesn't (red), 2 makes every surface a mirror
 
 namespace vk
@@ -2348,7 +2349,7 @@ void vkrt_trace()
         fp.params[1] = rtgisigma;
         fp.params[2] = fp.params[3] = 0;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gifilterpipe);
-        int from = 0, passes = rr && dlssrrraw >= 1 ? 0 : rtgifilter;
+        int from = 0, passes = rr && dlssrrraw >= 2 ? 0 : rtgifilter;
         loopi(passes)
         {
             asbarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT);

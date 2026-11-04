@@ -4216,7 +4216,7 @@ namespace game
         nexttype = -1;
     }
 
-    FVAR(0, spinyaw, -3600, 0, 3600); // development aid: turns an editing or spectating player this many degrees a second
+    FVAR(0, spinyaw, -3600, 0, 3600); // development aid: turns the player this many degrees a second
 
     void updateworld() // main game update loop
     {
@@ -4246,7 +4246,16 @@ namespace game
             }
 
             checklights();
-            if(spinyaw && (player1->state == CS_EDITING || player1->state == CS_SPECTATOR)) player1->yaw += spinyaw*curtime/1000.0f;
+            if(spinyaw && !gs_waiting(gamestate))
+            {
+                // turns what the mouse would turn
+                physent *d = (focus == player1 && player1->emoting(lastmillis)) || ((!gs_playing(gamestate) || player1->state >= CS_SPECTATOR) && (focus == player1 || followaim())) ? camera1 : (allowmove(player1) ? (physent *)player1 : NULL);
+                if(d)
+                {
+                    d->yaw += spinyaw*curtime/1000.0f;
+                    fixrange(d->yaw, d->pitch);
+                }
+            }
             player1->conopen = hud::hasinput(true);
             checkoften(player1, true);
             loopv(players) if(players[i]) checkoften(players[i], players[i]->ai != NULL);

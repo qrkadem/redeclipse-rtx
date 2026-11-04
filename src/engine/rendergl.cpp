@@ -1290,6 +1290,7 @@ vec calcavatarpos(const vec &pos, float fov)
 
 void setavatarscale(float fov, float zscale)
 {
+    vk_avatarpass();
     projmatrix.perspective(fov, aspect, nearplane, farplane);
     projmatrix.scalez(zscale);
     setcamprojmatrix(false);
@@ -1301,7 +1302,13 @@ void renderavatar()
 
     enableavatarmask();
     vkrt_pausecapture(true); // the first person model isn't part of the traced scene
+    // it writes its own motion, sway and all, as the models before it did
+    bool velocity = gvelocitytex && !drawtex && !msaalight;
+    if(velocity) maskgbuffer("cndv");
+    vk_avatarmotion(true);
     game::renderavatar();
+    vk_avatarmotion(false);
+    if(velocity) maskgbuffer("cnd");
     vkrt_pausecapture(false);
     disableavatarmask();
 
