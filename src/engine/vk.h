@@ -36,7 +36,15 @@ extern bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, cons
 // DLSS anti-aliasing, see vkdlss.cpp
 extern bool vk_dlssactive();
 extern bool vk_dlssrractive();     // DLSS ray reconstruction denoises and anti-aliases the lit frame, in place of DLAA
-extern bool vk_dlssrrapply();      // before tonemapping, on hdrfbo; false when it couldn't
+// before tonemapping: 1 when it replaced hdrfbo, 2 when it brought the frame up to the screen's size (vk_dlssrrfinal
+// gives the frame to tonemap and where to), 0 when it couldn't
+extern int vk_dlssrrapply();
+extern GLuint vk_dlssrrfinal(GLuint &tex, int &w, int &h);
+extern bool vk_dlssjittering();    // the projection follows DLSS's sub-pixel offsets
+extern float vk_dlssrenderscale(); // the share of the screen's size the view is drawn at, for DLSS to bring up
+extern bool vk_dlssupscaling();    // super resolution brings the view up, so the view itself has no anti-aliasing
+extern void vk_dlssprepare();      // once the view is drawn
+extern bool vk_dlssupscale(GLuint srcfbo, int w, int h, GLuint outfbo, int outw, int outh); // in place of stretching the view to the screen
 extern void vk_dlssnextjitter();
 extern vec2 vk_dlssjitter();       // render pixels
 extern GLuint vk_dlssinput();      // where the tonemapped frame goes

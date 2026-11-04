@@ -651,6 +651,7 @@ namespace vk
             fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
             if(vkCreateFence(device, &fci, NULL, &rtfences[i]) != VK_SUCCESS) return false;
         }
+        NAMECMDS(rtcmds, "rt trace");
         rtfailed = false;
         rtloaded = true;
         return true;
@@ -1050,6 +1051,9 @@ namespace vk
            !createsharedimage(rtresult, w, h, VK_FORMAT_R16G16_SFLOAT, GL_RG16F, GL_TEXTURE_RECTANGLE))
             return false;
         loopi(2) if(!createdeviceimage(rthist[i], w, h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
+        NAMEIMAGE(rtpos, "rtpos");
+        NAMEIMAGE(rtnormal, "rtnormal");
+        NAMEIMAGE(rtresult, "rtresult");
         if(!createsharedsemaphore(rtready) || !createsharedsemaphore(rtdone)) return false;
 
         glGenFramebuffers_(1, &rtfbo);
@@ -1527,6 +1531,7 @@ namespace vk
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qpci.queryCount = 4;
         if(vkCreateQueryPool(device, &qpci, NULL, &rfqueries) != VK_SUCCESS) rfqueries = VK_NULL_HANDLE;
+        NAMECMDS(rfcmds, "rt reflections");
         rffailed = false;
         rfloaded = true;
         return true;
@@ -1568,6 +1573,8 @@ namespace vk
                     !createdeviceimage(rfhistaux[i], w, h, VK_FORMAT_R16G16B16A16_SFLOAT, usage))
             return false;
         if(!createsharedsemaphore(rfready) || !createsharedsemaphore(rfdone)) return false;
+        NAMEIMAGE(rflit, "rflit");
+        NAMEIMAGE(rfout, "rfout");
 
         glGenFramebuffers_(1, &rflitfbo);
         glBindFramebuffer_(GL_FRAMEBUFFER, rflitfbo);
@@ -1705,6 +1712,7 @@ namespace vk
                     !createdeviceimage(gihistaux[i], hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage) ||
                     !createdeviceimage(gifilt[i], hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, usage))
             return false;
+        NAMEIMAGE(giout, "giout");
         glBindTexture(GL_TEXTURE_RECTANGLE, giout.gltex);
         glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);

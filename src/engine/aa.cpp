@@ -681,7 +681,7 @@ void jitteraa()
 {
     nojittermatrix = projmatrix;
 
-    if(vk_dlssactive() || vk_dlssrractive())
+    if(vk_dlssjittering())
     {
         // DLSS gathers a longer sequence of offsets than TQAA's two
         vec2 jitter = vk_dlssjitter();
@@ -748,10 +748,24 @@ bool maskedaa()
     return tqaa && tqaamovemask;
 }
 
+extern GLuint hdrtonemaptex;
+extern int hdrtonemapw, hdrtonemaph;
+
 void doaa(GLuint outfbo, void (*resolve)(GLuint, int))
 {
-    // ray reconstruction anti-aliases the lit frame, which is then only tonemapped
-    if(vk_dlssrractive() && vk_dlssrrapply()) resolve(outfbo, AA_UNUSED);
+    // ray reconstruction anti-aliases the lit frame, which is then only tonemapped, at the screen's size if it brought
+    // it up there
+    int rr = vk_dlssrractive() ? vk_dlssrrapply() : 0;
+    if(rr == 1) resolve(outfbo, AA_UNUSED);
+    else if(rr == 2)
+    {
+        GLuint finalfbo = vk_dlssrrfinal(hdrtonemaptex, hdrtonemapw, hdrtonemaph);
+        resolve(finalfbo, AA_UNUSED);
+        hdrtonemaptex = 0;
+        hdrtonemapw = hdrtonemaph = 0;
+    }
+    // super resolution anti-aliases as it brings the view up to the screen, later
+    else if(vk_dlssupscaling()) resolve(outfbo, AA_UNUSED);
     else if(vk_dlssactive())
     {
         resolve(vk_dlssinput(), AA_UNUSED);

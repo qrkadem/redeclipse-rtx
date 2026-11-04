@@ -997,6 +997,10 @@ const GLint *swizzlemask(GLenum format)
     return NULL;
 }
 
+// mipmapped textures read their mips this much sharper: rendering below the display's size for DLSS to bring up, they
+// keep the detail they would have at the display's size
+static float texlodbias = 0;
+
 void setuptexparameters(int tnum, const void *pixels, int tclamp, int filter, GLenum format, GLenum target, bool swizzle)
 {
     glBindTexture(target, tnum);
@@ -1011,11 +1015,37 @@ void setuptexparameters(int tnum, const void *pixels, int tclamp, int filter, GL
                 (bilinear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR) :
                 (bilinear ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST)) :
             (!(tclamp&0x8000) && filter && bilinear ? GL_LINEAR : GL_NEAREST));
+    if(target==GL_TEXTURE_2D && !(tclamp&0x8000) && filter > 1) glTexParameterf(target, GL_TEXTURE_LOD_BIAS, texlodbias);
     if(swizzle && hasTSW)
     {
         const GLint *mask = swizzlemask(format);
         if(mask) glTexParameteriv(target, GL_TEXTURE_SWIZZLE_RGBA, mask);
     }
+}
+
+extern hashnameset<Texture> textures;
+
+void settexlodbias(float bias)
+{
+    if(bias == texlodbias) return;
+    texlodbias = bias;
+    GLint oldtex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldtex);
+    enumerate(textures, Texture, tex,
+    {
+        if((tex.type&Texture::TYPE) != Texture::IMAGE || !tex.mipmap) continue;
+        loopv(tex.frames) if(tex.frames[i])
+        {
+            glBindTexture(GL_TEXTURE_2D, tex.frames[i]);
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, bias);
+        }
+        if(tex.id && tex.frames.find(tex.id) < 0)
+        {
+            glBindTexture(GL_TEXTURE_2D, tex.id);
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_LOD_BIAS, bias);
+        }
+    });
+    glBindTexture(GL_TEXTURE_2D, oldtex);
 }
 
 static GLenum textype(GLenum &component, GLenum &format)

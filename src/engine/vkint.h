@@ -28,6 +28,9 @@ namespace vk
     extern VkCommandBuffer begincommands();          // one-off commands on the main thread
     extern bool endcommands(VkCommandBuffer cmd);    // submits them and waits
     extern const char *resultname(VkResult r);
+    extern void nameobject(VkObjectType type, uint64_t handle, const char *name); // for the validation layer's messages
+    #define NAMEIMAGE(img, name) nameobject(VK_OBJECT_TYPE_IMAGE, uint64_t((img).image), name)
+    #define NAMECMDS(cmds, name) loopi(2) nameobject(VK_OBJECT_TYPE_COMMAND_BUFFER, uint64_t((cmds)[i]), name)
 
     // an image Vulkan allocated that GL draws into or reads as a texture
     struct deviceimage;
@@ -151,7 +154,7 @@ namespace vk
         float worldtoview[16], viewtoclip[16];
         bool reset;
     };
-    extern bool ngx_rrready(int w, int h);
+    extern bool ngx_rrready(int w, int h, int outw, int outh, int quality);
     extern bool ngx_rrevaluate(VkCommandBuffer cmd, const rrinputs &in);
     extern void ngx_rrrelease();
 

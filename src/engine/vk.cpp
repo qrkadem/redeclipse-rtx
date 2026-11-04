@@ -48,6 +48,18 @@ namespace vk
     bool hasrt = false;
 
     static VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    static PFN_vkSetDebugUtilsObjectNameEXT SetDebugUtilsObjectNameEXT = NULL;
+
+    // with the validation layer: a name its messages give the object by
+    void nameobject(VkObjectType type, uint64_t handle, const char *name)
+    {
+        if(!SetDebugUtilsObjectNameEXT || !device || !handle) return;
+        VkDebugUtilsObjectNameInfoEXT ni = { VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        ni.objectType = type;
+        ni.objectHandle = handle;
+        ni.pObjectName = name;
+        SetDebugUtilsObjectNameEXT(device, &ni);
+    }
     static VkSurfaceKHR surface = VK_NULL_HANDLE;
     static VkPhysicalDeviceMemoryProperties memprops;
     static SDL_Window *glwindow = NULL;
@@ -1426,6 +1438,7 @@ namespace vk
             dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
             dci.pfnUserCallback = debugcallback;
             if(create) create(instance, &dci, NULL, &messenger);
+            SetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetInstanceProcAddr(instance, "vkSetDebugUtilsObjectNameEXT");
         }
         return true;
     }
@@ -2056,7 +2069,8 @@ void vk_present()
     if(hdrframe)
     {
         bool hudlesshdr = f.hashudless && numgen && f.hdrhudless.image; // frame generation wants it in HDR too
-        deviceimage *outs[2] = { &f.hdr, hudlesshdr ? &f.hdrhudless : NULL };
+        // the copy without the HUD is in the descriptors whether written this frame or not, so it is in their layout
+        deviceimage *outs[2] = { &f.hdr, f.hdrhudless.image ? &f.hdrhudless : NULL };
         // the presenting thread's last copy from these images came before
         loopi(2) if(outs[i]) imagebarrier(cmd, outs[i]->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);

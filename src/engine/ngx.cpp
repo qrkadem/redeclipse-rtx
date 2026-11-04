@@ -359,7 +359,7 @@ namespace vk
     // DLSS ray reconstruction
     static NVSDK_NGX_Handle *rrhandle = NULL;
     static NVSDK_NGX_Parameter *rrparams = NULL;
-    static int rrw = 0, rrh = 0;
+    static int rrw = 0, rrh = 0, rroutw = 0, rrouth = 0, rrquality = -1;
     static bool rrfailed = false;
 
     void ngx_rrrelease()
@@ -368,16 +368,20 @@ namespace vk
         rrhandle = NULL;
         if(rrparams) NVSDK_NGX_VULKAN_DestroyParameters(rrparams);
         rrparams = NULL;
-        rrw = rrh = 0;
+        rrw = rrh = rroutw = rrouth = 0;
+        rrquality = -1;
     }
 
-    bool ngx_rrready(int w, int h)
+    bool ngx_rrready(int w, int h, int outw, int outh, int quality)
     {
         if(!ngxinited || !dlssrravailable) return false;
-        if(rrw == w && rrh == h) return rrhandle != NULL && !rrfailed;
+        if(rrw == w && rrh == h && rroutw == outw && rrouth == outh && rrquality == quality) return rrhandle != NULL && !rrfailed;
         ngx_rrrelease();
         rrw = w;
         rrh = h;
+        rroutw = outw;
+        rrouth = outh;
+        rrquality = quality;
         rrfailed = true;
         if(NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&rrparams)) || !rrparams) return false;
         VkCommandBuffer cmd = begincommands();
@@ -387,21 +391,23 @@ namespace vk
         cp.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
         cp.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed; // in the normals' w
         cp.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
-        cp.InWidth = cp.InTargetWidth = w;
-        cp.InHeight = cp.InTargetHeight = h;
-        cp.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+        cp.InWidth = w;
+        cp.InHeight = h;
+        cp.InTargetWidth = outw;
+        cp.InTargetHeight = outh;
+        cp.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value(quality);
         // motion vectors at the render size without jitter, the lit frame before tonemapping, exposed by DLSS itself
         cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes|NVSDK_NGX_DLSS_Feature_Flags_IsHDR|NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
         NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSSD_EXT1(device, cmd, 1, 1, &rrhandle, rrparams, &cp);
         bool ok = endcommands(cmd);
         if(NVSDK_NGX_FAILED(r) || !ok || !rrhandle)
         {
-            conoutf(colourred, "DLSS: ray reconstruction could not start for %dx%d (0x%X)", w, h, unsigned(r));
+            conoutf(colourred, "DLSS: ray reconstruction could not start for %dx%d to %dx%d (0x%X)", w, h, outw, outh, unsigned(r));
             rrhandle = NULL;
             return false;
         }
         rrfailed = false;
-        conoutf(colourwhite, "DLSS: ray reconstruction ready, %dx%d", w, h);
+        conoutf(colourwhite, "DLSS: ray reconstruction ready, %dx%d to %dx%d", w, h, outw, outh);
         return true;
     }
 
@@ -468,7 +474,7 @@ namespace vk
     bool ngx_srready(int w, int h, int outw, int outh, int quality) { return false; }
     bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in) { return false; }
     void ngx_srrelease() {}
-    bool ngx_rrready(int w, int h) { return false; }
+    bool ngx_rrready(int w, int h, int outw, int outh, int quality) { return false; }
     bool ngx_rrevaluate(VkCommandBuffer cmd, const rrinputs &in) { return false; }
     void ngx_rrrelease() {}
     bool ngx_fgready(int w, int h, int renderw, int renderh, VkFormat format) { return false; }

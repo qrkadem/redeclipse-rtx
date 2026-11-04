@@ -405,15 +405,28 @@ void cleanupscale()
     scalew = scaleh = -1;
 }
 
-vec2 renderdepthscale(int w, int h)
+// the size the view is drawn at before it is brought up to the screen: DLSS's, when it upscales, else gscale's
+static void scaledsize(int &sw, int &sh)
 {
-    int sw = renderw, sh = renderh;
-    if(gscale != 100)
+    sw = renderw;
+    sh = renderh;
+    float dlssscale = vk_dlssrenderscale();
+    if(dlssscale < 1)
+    {
+        sw = max(int(renderw*dlssscale + 0.5f), 1);
+        sh = max(int(renderh*dlssscale + 0.5f), 1);
+    }
+    else if(gscale != 100)
     {
         sw = max((renderw*gscale + 99)/100, 1);
         sh = max((renderh*gscale + 99)/100, 1);
     }
+}
 
+vec2 renderdepthscale(int w, int h)
+{
+    int sw, sh;
+    scaledsize(sw, sh);
     return vec2(sw / float(w), sh / float(h));
 }
 
@@ -469,6 +482,13 @@ void doscale(GLuint outfbo, int w, int h)
     timer *scaletimer = begintimer("Scaling");
     if(w <= 0) w = hudw;
     if(h <= 0) h = hudh;
+
+    // DLSS brings the view up to the screen, from the view as drawn or, with ray reconstruction, by itself already
+    if(vk_dlssupscale(scalefbo[0], gw, gh, outfbo, w, h))
+    {
+        endtimer(scaletimer);
+        return;
+    }
 
     if(shouldscalecubic())
     {
@@ -794,12 +814,8 @@ void bindgdepth()
 
 void setupgbuffer()
 {
-    int sw = renderw, sh = renderh;
-    if(gscale != 100)
-    {
-        sw = max((renderw*gscale + 99)/100, 1);
-        sh = max((renderh*gscale + 99)/100, 1);
-    }
+    int sw, sh;
+    scaledsize(sw, sh);
 
     if(gw == sw && gh == sh && scalew == hudw && scaleh == hudh) return;
 
@@ -1123,6 +1139,11 @@ void loadhdrshaders(int aa)
     }
 }
 
+// what the final tonemap reads, when not the lit frame at the view's size: DLSS ray reconstruction's frame, brought
+// up to the screen's size
+GLuint hdrtonemaptex = 0;
+int hdrtonemapw = 0, hdrtonemaph = 0;
+
 void processhdr(GLuint outfbo, int aa)
 {
     timer *hdrtimer = begintimer("HDR Processing");
@@ -1326,9 +1347,10 @@ void processhdr(GLuint outfbo, int aa)
     }
     else if(msaalight <= 1 || !msaatonemap)
     {
+        int tw = hdrtonemaptex ? hdrtonemapw : vieww, th = hdrtonemaptex ? hdrtonemaph : viewh;
         glBindFramebuffer_(GL_FRAMEBUFFER, outfbo);
-        glViewport(0, 0, vieww, viewh);
-        glBindTexture(GL_TEXTURE_RECTANGLE, hdrtex);
+        glViewport(0, 0, tw, th);
+        glBindTexture(GL_TEXTURE_RECTANGLE, hdrtonemaptex ? hdrtonemaptex : hdrtex);
         glActiveTexture_(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_RECTANGLE, b0tex);
         glActiveTexture_(GL_TEXTURE0);
@@ -1342,11 +1364,11 @@ void processhdr(GLuint outfbo, int aa)
                     glStencilFunc(GL_EQUAL, 0, 0x80);
                     glEnable(GL_STENCIL_TEST);
                     SETSHADER(hdrtonemap);
-                    screenquad(vieww, viewh, b0w, b0h);
+                    screenquad(tw, th, b0w, b0h);
 
                     glStencilFunc(GL_EQUAL, 0x80, 0x80);
                     SETSHADER(hdrtonemapstencil);
-                    screenquad(vieww, viewh, b0w, b0h);
+                    screenquad(tw, th, b0w, b0h);
                     glDisable(GL_STENCIL_TEST);
                     goto done;
                 }
@@ -1355,7 +1377,7 @@ void processhdr(GLuint outfbo, int aa)
                 break;
             default: SETSHADER(hdrtonemap); break;
         }
-        screenquad(vieww, viewh, b0w, b0h);
+        screenquad(tw, th, b0w, b0h);
     }
     else
     {
