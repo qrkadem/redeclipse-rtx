@@ -1,0 +1,58 @@
+// Ray traced reflections, filtered over neighbours on the same surface (vkrt.cpp): wider the rougher the surface and
+// the shorter its history, not at all on mirrors, whose reflection is sharp
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D color;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D aux;      // x distance to hits, y to the camera, z frames, w roughness
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D positions;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D normals;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D result;
+
+layout(push_constant) uniform Params
+{
+    vec4 campos; // xyz camera
+    vec4 params; // x radius in pixels at the roughest, y roughness that gets no rays
+} pc;
+
+void main()
+{
+    ivec2 size = imageSize(positions);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p), a = imageLoad(aux, p);
+    float rough = a.w;
+    if(wp.w <= 0.0 || a.z <= 0.0 || rough >= pc.params.y)
+    {
+        imageStore(result, p, vec4(0.0));
+        return;
+    }
+    vec4 centre = imageLoad(color, p);
+    // every pixel within reach: skipping some would leave each pixel blending only those in step with it, a grid
+    float r = pc.params.x*clamp(2.0*rough/pc.params.y, 0.0, 1.0);
+    if(a.z < 4.0) r = min(r*2.0, 4.0);
+    int radius = int(r + 0.5);
+    if(radius <= 0)
+    {
+        imageStore(result, p, centre);
+        return;
+    }
+    vec3 n = normalize(imageLoad(normals, p).xyz);
+    float planescale = 1.0/(0.01*distance(wp.xyz, pc.campos.xyz) + 0.1), spread = 0.5/(r*r);
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for(int y = -radius; y <= radius; y++) for(int x = -radius; x <= radius; x++)
+    {
+        ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+        vec4 qp = imageLoad(positions, q), qa = imageLoad(aux, q);
+        if(qp.w <= 0.0 || qa.z <= 0.0) continue;
+        vec3 qn = normalize(imageLoad(normals, q).xyz);
+        float w = pow(max(dot(n, qn), 0.0), 32.0) * exp(-abs(dot(qp.xyz - wp.xyz, n))*planescale) *
+                  exp(-abs(qa.w - rough)*20.0) * exp(-float(x*x + y*y)*spread);
+        sum += imageLoad(color, q)*w;
+        total += w;
+    }
+    imageStore(result, p, total > 0.0 ? sum/total : centre);
+}

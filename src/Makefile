@@ -1173,7 +1173,7 @@ engine/engine.h.gch: engine/soundenvprop.h engine/vk.h
 
 engine/vk.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h engine/vkshaders/hdrencode.spv.h
 engine/ngx.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h
-engine/vkrt.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h engine/vkshaders/rttrace.spv.h engine/vkshaders/rtfilter.spv.h engine/vkshaders/rtskin.spv.h
+engine/vkrt.o: engine/engine.h engine/vk.h engine/vkint.h shared/cube.h shared/tools.h engine/vkshaders/rttrace.spv.h engine/vkshaders/rtfilter.spv.h engine/vkshaders/rtskin.spv.h engine/vkshaders/rtrefl.spv.h engine/vkshaders/rtrefltemporal.spv.h engine/vkshaders/rtreflfilter.spv.h
 
 # Vulkan compute shaders, built into headers holding their SPIR-V
 engine/vkshaders/%.spv.h: engine/vkshaders/%.comp

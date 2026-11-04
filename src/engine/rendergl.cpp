@@ -1747,6 +1747,7 @@ static void blendfog(int fogmat, float below, float blend, float logblend, float
 }
 
 vec curfogcolor(0, 0, 0);
+vec2 curfogdensity(0, 1); // the fog's density and scale, as the shaders take them
 
 void setfogcolor(const vec &v)
 {
@@ -1799,6 +1800,7 @@ void setfog(int fogmat, float below, float blend, int abovemat)
     GLOBALPARAM(fogcolor, curfogcolor);
 
     float fogdensity = calcfogdensity(end-start);
+    curfogdensity = vec2(fogdensity, 1/exp(M_LN2*start*fogdensity));
     GLOBALPARAMF(fogdensity, fogdensity, 1/exp(M_LN2*start*fogdensity));
 }
 

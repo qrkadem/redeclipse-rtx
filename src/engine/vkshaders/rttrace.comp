@@ -78,7 +78,7 @@ void main()
             // cosine weighted over the hemisphere
             float r1 = rnd(seed), r2 = rnd(seed), r = sqrt(r1), phi = 6.28318531*r2;
             vec3 d = normalize(t*(r*cos(phi)) + b*(r*sin(phi)) + n*sqrt(max(1.0 - r1, 0.0)));
-            if(occluded(o, d, pc.params.x, 0xFFu)) hits += 1.0;
+            if(occluded(o, d, pc.params.x, 0x07u)) hits += 1.0; // map models that cast no shadow are only reflected
         }
         ao = 1.0 - hits/float(rays);
     }

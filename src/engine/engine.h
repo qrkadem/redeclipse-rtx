@@ -323,6 +323,7 @@ extern int drawtex;
 extern const matrix4 viewmatrix, invviewmatrix;
 extern matrix4 cammatrix, projmatrix, camprojmatrix, invcammatrix, invcamprojmatrix, invprojmatrix;
 extern vec curfogcolor;
+extern vec2 curfogdensity;
 extern int wireframe, editinhibit;
 
 extern float cursorx, cursory, cursoryaw, cursorpitch;

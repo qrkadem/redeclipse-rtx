@@ -1,0 +1,108 @@
+// Ray traced reflections over time (vkrt.cpp): this frame's ray blends into what the same reflection showed before.
+// A mirror's reflection moves as the reflected point does, seen through the mirror, so smooth surfaces find their
+// history there; rougher ones where the surface itself was. The history is kept within the spread of this frame's
+// neighbours, so a reflection that changed doesn't linger.
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D positions;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D normals;   // w roughness
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D raw;       // this frame's ray: light, a hit
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D rawaux;    // x distance to the hit, 0 for a miss
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D prevcolor;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D prevaux;   // x distance to hits, y to the camera, z frames, w roughness
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D curcolor;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D curaux;
+
+layout(push_constant) uniform Params
+{
+    mat4 prevclip;   // world to last frame's clip space
+    vec4 campos;     // xyz camera
+    vec4 prevcampos; // xyz last frame's camera
+    vec4 params;     // x most frames kept, y roughness that gets no rays
+} pc;
+
+bool history(vec3 point, vec3 surf, float rough, float tolerance, ivec2 size, out vec4 color, out vec4 aux)
+{
+    color = aux = vec4(0.0);
+    vec4 prev = pc.prevclip * vec4(point, 1.0);
+    if(prev.w <= 0.0) return false;
+    ivec2 q = ivec2(floor((prev.xy/prev.w*0.5 + 0.5)*vec2(size)));
+    if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) return false;
+    aux = imageLoad(prevaux, q);
+    float prevdist = distance(surf, pc.prevcampos.xyz);
+    if(aux.z <= 0.0 || abs(aux.y - prevdist) > tolerance*prevdist + 0.25 || abs(aux.w - rough) > 0.1) return false;
+    color = imageLoad(prevcolor, q);
+    return true;
+}
+
+void main()
+{
+    ivec2 size = imageSize(positions);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x >= size.x || p.y >= size.y) return;
+
+    vec4 wp = imageLoad(positions, p);
+    float rough = imageLoad(normals, p).w;
+    if(wp.w <= 0.0 || rough >= pc.params.y)
+    {
+        imageStore(curcolor, p, vec4(0.0));
+        imageStore(curaux, p, vec4(0.0));
+        return;
+    }
+    vec4 c = imageLoad(raw, p);
+    float hitdist = imageLoad(rawaux, p).x, surfdist = distance(wp.xyz, pc.campos.xyz);
+
+    // the spread of this frame's rays around here, and the brightest of the neighbours: a ray far brighter than all of
+    // them is a rare light it happened to find, which would stand out for as long as the history keeps it
+    vec4 m1 = vec4(0.0), m2 = vec4(0.0);
+    float n = 0.0, brightest = 0.0;
+    const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
+    for(int y = -1; y <= 1; y++) for(int x = -1; x <= 1; x++)
+    {
+        ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+        if(imageLoad(positions, q).w <= 0.0) continue;
+        vec4 s = imageLoad(raw, q);
+        if(x != 0 || y != 0) brightest = max(brightest, dot(s.rgb, lum));
+        m1 += s;
+        m2 += s*s;
+        n += 1.0;
+    }
+    float bright = dot(c.rgb, lum), limit = 2.0*brightest + 0.01;
+    if(bright > limit)
+    {
+        vec4 spike = c;
+        c.rgb *= limit/bright;
+        m1 += c - spike;
+        m2 += c*c - spike*spike;
+    }
+    m1 /= n;
+    m2 /= n;
+    vec4 sigma = sqrt(max(m2 - m1*m1, vec4(0.0)));
+
+    vec4 hc, ha;
+    bool found = false;
+    if(hitdist > 0.0 && rough < 0.5*pc.params.y)
+    {
+        vec3 reflected = wp.xyz + (wp.xyz - pc.campos.xyz)*(hitdist/surfdist);
+        found = history(reflected, wp.xyz, rough, 0.1, size, hc, ha);
+    }
+    if(!found) found = history(wp.xyz, wp.xyz, rough, 0.02, size, hc, ha);
+
+    vec4 result = c;
+    float count = 1.0, dist = hitdist;
+    if(found)
+    {
+        // tight on mirrors, whose rays agree, so a reflection that changed doesn't linger; looser the rougher, where
+        // single rays differ anyway and a tight box would only put their noise back
+        float box = mix(1.25, 3.0, clamp(rough/(0.5*pc.params.y), 0.0, 1.0));
+        hc = clamp(hc, m1 - box*sigma, m1 + box*sigma);
+        count = min(ha.z + 1.0, pc.params.x);
+        result = mix(hc, c, 1.0/count);
+        if(hitdist <= 0.0) dist = ha.x;
+        else if(ha.x > 0.0) dist = mix(ha.x, hitdist, 1.0/count);
+    }
+    imageStore(curcolor, p, result);
+    imageStore(curaux, p, vec4(dist, surfdist, count, rough));
+}

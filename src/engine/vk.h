@@ -65,6 +65,29 @@ extern bool vkrt_sunready();     // the world's sun shadow comes from ray tracin
 extern GLuint vkrt_texture();    // the result for GL's lighting: r ambient occlusion, g sun shadow
 extern void vkrt_trace();        // between the G-buffer and lighting
 extern void vkrt_worldchanged();
+extern void vkrt_newmap();       // a map was loaded: its textures are read again for reflections
+// ray traced reflections, after lighting: a light that can reach what is reflected, laid out as the shader reads it
+struct rtrefllight
+{
+    vec o;
+    float radius;
+    vec color;     // as the deferred shading scales it
+    float flags;   // 1 when it casts no shadow
+    vec spotdir;   // from the spot's target towards the light
+    float spotscale; // 1/(1 - cos of the spot's angle), 0 for a point light
+};
+// how the deferred shading lights the scene, for what is reflected off screen
+struct rtreflshading
+{
+    vec ambient, suncolor, sundir, skycolor, fogcolor;
+    float glowscale, fogdensity, fogscale;
+    bool sun;
+};
+extern float rtreflrough;          // roughness at which traced reflections give way to the environment maps
+extern bool reflectionsenabled();  // renderlights.cpp: the reflection pass runs this frame
+extern bool vkrt_reflavailable();
+// the reflected light, premultiplied by how much of it the rays found (alpha), or 0 when there is none this frame
+extern GLuint vkrt_reflect(GLuint litfbo, int w, int h, const rtreflshading &s, const rtrefllight *lights, int numlights);
 extern void vkrt_cleanupgl();
 extern void vkrt_shutdown();
 extern bool vk_hastear();

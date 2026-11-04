@@ -2000,7 +2000,7 @@ void allchanged(bool load)
     if(!connected()) load = false;
     progress(-20, "Recalculating world..");
     loadstep(NULL);
-    PROGRESS(0); if(load) initlights();
+    PROGRESS(0); if(load) { initlights(); vkrt_newmap(); }
     PROGRESS(1); clearvas(worldroot);
     PROGRESS(2); resetqueries();
     PROGRESS(3); resetclipplanes();

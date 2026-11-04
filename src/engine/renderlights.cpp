@@ -5580,13 +5580,66 @@ FVAR(IDF_PERSIST, reflssrrough, 0, 0.6f, 1); // roughness at which screen space 
 // envmaps are drawn at an ldrscale of 1, where the view uses its own
 static const float envmapldrscale = 1.0f;
 
+bool reflectionsenabled() { return reflections && !drawtex && !msaasamples && !(editmode && fullbright); }
+
+// ray traced reflections: the lit scene, how it was lit, and the lights that can reach what is reflected, so what
+// rays hit off screen is lit the same way
+static GLuint tracereflections()
+{
+    if(!vkrt_reflavailable()) return 0;
+    float lightscale = 2.0f*ldrscaleb;
+    rtreflshading s;
+    bvec amb = worldcols[WORLDCOL_F_AMBIENT], pie = worldcols[WORLDCOL_F_SUNLIGHT];
+    s.ambient = vec(amb.x, amb.y, amb.z).mul(lightscale*getambientscale());
+    s.glowscale = 255*lightscale;
+    s.sun = !pie.iszero() && getpielightscale() > 0;
+    s.suncolor = vec(pie.x, pie.y, pie.z).mul(lightscale*getpielightscale());
+    s.sundir = getpielightdir();
+    // the open sky lights through GI, where the map has it
+    if(s.sun && useradiancehints())
+    {
+        bvec piesky = getskylight();
+        s.skycolor = vec(piesky.x, piesky.y, piesky.z).mul(2*getgiaoscale()*lightscale*getskylightscale());
+    }
+    else s.skycolor = vec(0, 0, 0);
+    s.fogcolor = curfogcolor;
+    s.fogdensity = curfogdensity.x;
+    s.fogscale = curfogdensity.y;
+
+    static vector<rtrefllight> rl;
+    rl.setsize(0);
+    loopv(lights)
+    {
+        const lightinfo &l = lights[i];
+        if(l.radius <= 0 || l.color.iszero()) continue;
+        rtrefllight &r = rl.add();
+        r.o = l.o;
+        r.radius = l.radius;
+        r.color = vec(l.color).mul(lightscale);
+        r.flags = l.noshadow() ? 1 : 0;
+        if(l.spot > 0)
+        {
+            r.spotdir = vec(l.dir).neg();
+            r.spotscale = 1/(1 - cos360(l.spot));
+        }
+        else
+        {
+            r.spotdir = vec(0, 0, 0);
+            r.spotscale = 0;
+        }
+    }
+    return vkrt_reflect(hdrfbo, vieww, viewh, s, rl.getbuf(), rl.length());
+}
+
 void renderreflections()
 {
-    if(!reflections || drawtex || msaasamples || (editmode && fullbright)) return;
+    if(!reflectionsenabled()) return;
 
     timer *refltimer = begintimer("Reflections");
 
-    if(reflssr)
+    GLuint rttex = tracereflections();
+    bool ssr = reflssr && !rttex;
+    if(ssr)
     {
         // the march reads a copy of the lit scene, since it adds to the scene itself
         if(!refltex || reflw != gw || reflh != gh)
@@ -5625,10 +5678,10 @@ void renderreflections()
     glBindTexture(GL_TEXTURE_RECTANGLE, gcolortex);
     glActiveTexture_(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_RECTANGLE, gnormaltex);
-    if(reflssr)
+    if(ssr || rttex)
     {
         glActiveTexture_(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_RECTANGLE, refltex);
+        glBindTexture(GL_TEXTURE_RECTANGLE, rttex ? rttex : refltex);
     }
     glActiveTexture_(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
@@ -5649,6 +5702,7 @@ void renderreflections()
     GLOBALPARAMF(reflparams, reflscale, skylod, skytex ? reflsky : 0.0f, ldrscale/envmapldrscale);
     GLOBALPARAMF(reflambient, reflambient);
     GLOBALPARAMF(reflssrparams, reflssrsteps, reflssrdist, reflssrthickness, reflssrrough);
+    GLOBALPARAMF(rtreflparams, rtreflrough);
     GLOBALPARAM(reflscreenmatrix, screenmatrix);
     GLOBALPARAMF(reflprobelod, probelods[0], probelods[1], probelods[2], probelods[3]);
     static GlobalShaderParam reflprobeposparam("reflprobepos");
@@ -5657,7 +5711,8 @@ void renderreflections()
     string opts;
     int optslen = 0;
     if(aoon()) opts[optslen++] = 'a';
-    if(reflssr) opts[optslen++] = 's';
+    if(ssr) opts[optslen++] = 's';
+    if(rttex) opts[optslen++] = 'r';
     if(reflprobes) opts[optslen++] = 'p';
     opts[optslen] = '\0';
     defformatstring(name, "reflection%s", opts);
