@@ -35,6 +35,8 @@ extern bool vk_drawmotion(GLuint fbo, int w, int h, const matrix4 &screenm, cons
 
 // DLSS anti-aliasing, see vkdlss.cpp
 extern bool vk_dlssactive();
+extern bool vk_dlssrractive();     // DLSS ray reconstruction denoises and anti-aliases the lit frame, in place of DLAA
+extern bool vk_dlssrrapply();      // before tonemapping, on hdrfbo; false when it couldn't
 extern void vk_dlssnextjitter();
 extern vec2 vk_dlssjitter();       // render pixels
 extern GLuint vk_dlssinput();      // where the tonemapped frame goes

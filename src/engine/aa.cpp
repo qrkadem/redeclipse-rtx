@@ -681,7 +681,7 @@ void jitteraa()
 {
     nojittermatrix = projmatrix;
 
-    if(vk_dlssactive())
+    if(vk_dlssactive() || vk_dlssrractive())
     {
         // DLSS gathers a longer sequence of offsets than TQAA's two
         vec2 jitter = vk_dlssjitter();
@@ -750,7 +750,9 @@ bool maskedaa()
 
 void doaa(GLuint outfbo, void (*resolve)(GLuint, int))
 {
-    if(vk_dlssactive())
+    // ray reconstruction anti-aliases the lit frame, which is then only tonemapped
+    if(vk_dlssrractive() && vk_dlssrrapply()) resolve(outfbo, AA_UNUSED);
+    else if(vk_dlssactive())
     {
         resolve(vk_dlssinput(), AA_UNUSED);
         vk_dlssapply(outfbo);

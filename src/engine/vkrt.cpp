@@ -61,6 +61,10 @@ VAR(IDF_PERSIST, rtgihistory, 1, 32, 128);       // most frames a surface's indi
 VAR(IDF_PERSIST, rtgifilter, 0, 3, 5);           // filter passes over the indirect light, each reaching twice as far
 FVAR(IDF_PERSIST, rtgisigma, 0.1f, 4, 64);       // how much of the indirect light's own noise the filter smooths over
 VAR(0, dbgrt, 0, 0, 2);
+// with DLSS ray reconstruction, which denoises the rays itself and wants each frame's own noise, not noise held over
+// from the frames before (it keeps that as detail): 0 keeps the rays' own filters, 1 leaves reflections
+// raw and indirect light unfiltered (but gathered over time, as it is traced at half resolution), 2 leaves both raw
+VAR(IDF_PERSIST, dlssrrraw, 0, 2, 2);
 VAR(0, dbgrtrefl, 0, 0, 2); // reflections show where they hit what the camera sees (green) and what it doesn't (red), 2 makes every surface a mirror
 
 namespace vk
@@ -2323,7 +2327,8 @@ void vkrt_trace()
         vec prevcam = history ? giprevcam : viewpos;
         hp.campos[0] = viewpos.x; hp.campos[1] = viewpos.y; hp.campos[2] = viewpos.z; hp.campos[3] = 0;
         hp.prevcampos[0] = prevcam.x; hp.prevcampos[1] = prevcam.y; hp.prevcampos[2] = prevcam.z; hp.prevcampos[3] = 0;
-        hp.params[0] = history ? rtgihistory : 1;
+        bool rr = vk_dlssrractive();
+        hp.params[0] = history && !(rr && dlssrrraw >= 2) ? rtgihistory : 1;
         hp.params[1] = hp.params[2] = hp.params[3] = 0;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gitemporalpipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gitemporallayout, 0, 1, &gitemporalsets[gicur], 0, NULL);
@@ -2335,8 +2340,8 @@ void vkrt_trace()
         fp.params[1] = rtgisigma;
         fp.params[2] = fp.params[3] = 0;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gifilterpipe);
-        int from = 0;
-        loopi(rtgifilter)
+        int from = 0, passes = rr && dlssrrraw >= 1 ? 0 : rtgifilter;
+        loopi(passes)
         {
             asbarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_SHADER_WRITE_BIT);
             fp.params[0] = float(1<<i);
@@ -2501,12 +2506,13 @@ GLuint vkrt_reflect(GLuint litfbo, int w, int h)
     vec prevcam = history ? rfprevcam : viewpos;
     hp.campos[0] = viewpos.x; hp.campos[1] = viewpos.y; hp.campos[2] = viewpos.z; hp.campos[3] = 0;
     hp.prevcampos[0] = prevcam.x; hp.prevcampos[1] = prevcam.y; hp.prevcampos[2] = prevcam.z; hp.prevcampos[3] = 0;
-    hp.params[0] = history ? rtreflhistory : 1;
+    bool rawrefl = dlssrrraw >= 1 && vk_dlssrractive();
+    hp.params[0] = history && !rawrefl ? rtreflhistory : 1;
     hp.params[1] = rtreflrough;
     hp.params[2] = hp.params[3] = 0;
     reflfilterparams fp;
     fp.campos[0] = viewpos.x; fp.campos[1] = viewpos.y; fp.campos[2] = viewpos.z; fp.campos[3] = 0;
-    fp.params[0] = rtreflfilter;
+    fp.params[0] = rawrefl ? 0 : rtreflfilter;
     fp.params[1] = rtreflrough;
     fp.params[2] = fp.params[3] = 0;
 

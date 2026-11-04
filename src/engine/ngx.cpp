@@ -18,6 +18,7 @@ FVAR(0, dlssgmvecscale, -1e3f, 1, 1e3f); // what NGX multiplies the motion vecto
 #include "nvsdk_ngx_params_dlssg.h"
 #include "nvsdk_ngx_defs_dlssd.h"
 #include "nvsdk_ngx_helpers_dlssg_vk.h"
+#include "nvsdk_ngx_helpers_dlssd_vk.h"
 
 namespace vk
 {
@@ -355,8 +356,98 @@ namespace vk
         return true;
     }
 
+    // DLSS ray reconstruction
+    static NVSDK_NGX_Handle *rrhandle = NULL;
+    static NVSDK_NGX_Parameter *rrparams = NULL;
+    static int rrw = 0, rrh = 0;
+    static bool rrfailed = false;
+
+    void ngx_rrrelease()
+    {
+        if(rrhandle) NVSDK_NGX_VULKAN_ReleaseFeature(rrhandle);
+        rrhandle = NULL;
+        if(rrparams) NVSDK_NGX_VULKAN_DestroyParameters(rrparams);
+        rrparams = NULL;
+        rrw = rrh = 0;
+    }
+
+    bool ngx_rrready(int w, int h)
+    {
+        if(!ngxinited || !dlssrravailable) return false;
+        if(rrw == w && rrh == h) return rrhandle != NULL && !rrfailed;
+        ngx_rrrelease();
+        rrw = w;
+        rrh = h;
+        rrfailed = true;
+        if(NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&rrparams)) || !rrparams) return false;
+        VkCommandBuffer cmd = begincommands();
+        if(!cmd) return false;
+        NVSDK_NGX_DLSSD_Create_Params cp;
+        memset(&cp, 0, sizeof(cp));
+        cp.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+        cp.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed; // in the normals' w
+        cp.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
+        cp.InWidth = cp.InTargetWidth = w;
+        cp.InHeight = cp.InTargetHeight = h;
+        cp.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+        // motion vectors at the render size without jitter, the lit frame before tonemapping, exposed by DLSS itself
+        cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes|NVSDK_NGX_DLSS_Feature_Flags_IsHDR|NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+        NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSSD_EXT1(device, cmd, 1, 1, &rrhandle, rrparams, &cp);
+        bool ok = endcommands(cmd);
+        if(NVSDK_NGX_FAILED(r) || !ok || !rrhandle)
+        {
+            conoutf(colourred, "DLSS: ray reconstruction could not start for %dx%d (0x%X)", w, h, unsigned(r));
+            rrhandle = NULL;
+            return false;
+        }
+        rrfailed = false;
+        conoutf(colourwhite, "DLSS: ray reconstruction ready, %dx%d", w, h);
+        return true;
+    }
+
+    bool ngx_rrevaluate(VkCommandBuffer cmd, const rrinputs &in)
+    {
+        if(!rrhandle || rrfailed) return false;
+        #define RRRES(name, img, rw) NVSDK_NGX_Resource_VK name = ngxresource(img->image, img->view, img->format, img->w, img->h, rw)
+        RRRES(color, in.color, false);
+        RRRES(diffuse, in.diffuse, false);
+        RRRES(specular, in.specular, false);
+        RRRES(normals, in.normals, false);
+        RRRES(mvec, in.mvec, false);
+        RRRES(depth, in.depth, false);
+        RRRES(output, in.output, true);
+        #undef RRRES
+        NVSDK_NGX_VK_DLSSD_Eval_Params ep;
+        memset(&ep, 0, sizeof(ep));
+        ep.pInColor = &color;
+        ep.pInOutput = &output;
+        ep.pInDiffuseAlbedo = &diffuse;
+        ep.pInSpecularAlbedo = &specular;
+        ep.pInNormals = &normals;
+        ep.pInDepth = &depth;
+        ep.pInMotionVectors = &mvec;
+        ep.InJitterOffsetX = in.jitterx;
+        ep.InJitterOffsetY = in.jittery;
+        ep.InRenderSubrectDimensions.Width = in.color->w;
+        ep.InRenderSubrectDimensions.Height = in.color->h;
+        ep.InReset = in.reset ? 1 : 0;
+        ep.InMVScaleX = ep.InMVScaleY = 1;
+        ep.InPreExposure = ep.InExposureScale = 1;
+        ep.pInWorldToViewMatrix = (float *)in.worldtoview;
+        ep.pInViewToClipMatrix = (float *)in.viewtoclip;
+        NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSSD_EXT(cmd, rrhandle, rrparams, &ep);
+        if(NVSDK_NGX_FAILED(r))
+        {
+            conoutf(colourred, "DLSS: ray reconstruction failed (0x%X), turning it off", unsigned(r));
+            rrfailed = true;
+            return false;
+        }
+        return true;
+    }
+
     void ngx_shutdown()
     {
+        ngx_rrrelease();
         ngx_srrelease();
         ngx_fgrelease();
         if(ngxcaps) NVSDK_NGX_VULKAN_DestroyParameters(ngxcaps);
@@ -377,6 +468,9 @@ namespace vk
     bool ngx_srready(int w, int h, int outw, int outh, int quality) { return false; }
     bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in) { return false; }
     void ngx_srrelease() {}
+    bool ngx_rrready(int w, int h) { return false; }
+    bool ngx_rrevaluate(VkCommandBuffer cmd, const rrinputs &in) { return false; }
+    void ngx_rrrelease() {}
     bool ngx_fgready(int w, int h, int renderw, int renderh, VkFormat format) { return false; }
     bool ngx_fgevaluate(VkCommandBuffer cmd, const fginputs &in, int numgen) { return false; }
     void ngx_fgrelease() {}

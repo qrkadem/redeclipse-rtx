@@ -142,6 +142,18 @@ namespace vk
     extern bool ngx_srready(int w, int h, int outw, int outh, int quality);
     extern bool ngx_srevaluate(VkCommandBuffer cmd, const srinputs &in);
     extern void ngx_srrelease();
+    // DLSS ray reconstruction: the lit frame before tonemapping, noisy ray traced light and all, with what it is made
+    // of, denoised and anti-aliased at the same size
+    struct rrinputs
+    {
+        sharedimage *color, *diffuse, *specular, *normals, *mvec, *depth, *output; // normals carry roughness in w
+        float jitterx, jittery;
+        float worldtoview[16], viewtoclip[16];
+        bool reset;
+    };
+    extern bool ngx_rrready(int w, int h);
+    extern bool ngx_rrevaluate(VkCommandBuffer cmd, const rrinputs &in);
+    extern void ngx_rrrelease();
 
     extern int ngx_fgmaxgen(); // 0 without frame generation
     extern bool ngx_fgready(int w, int h, int renderw, int renderh, VkFormat format); // creates the feature for these sizes and frame format if needed
