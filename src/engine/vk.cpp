@@ -15,6 +15,7 @@ static const uint32_t hdrencodespv[] =
 
 VARF(IDF_INIT, vulkan, 0, 1, 1, initwarning("Vulkan presenting", INIT_RESET));
 VAR(IDF_INIT, vkvalidation, 0, 0, 1); // Khronos validation layer, for development
+VAR(0, dbgvkhdrfail, 0, 0, 2); // development aid: 1 makes the display refuse HDR swapchains, 2 stop taking HDR frames
 VAR(0, dbgvk, 0, 0, 1);
 
 bool vkactive = false;
@@ -457,6 +458,10 @@ namespace vk
     static bool hascolorspace = false, hashdrmetadata = false, swaphdr = false, swapwanthdr = false;
     static bool hassurfacemaint = false; // what VK_EXT_swapchain_maintenance1 (wanted by NGX) needs from the instance
     static SDL_atomic_t hdrsurface;
+    // what the presenting thread ran into, for the main thread to act on and report: the display wouldn't take an HDR
+    // swapchain or stopped showing it (HDR output goes off), the last error remaking the swapchain, and a window that
+    // stopped getting images while it had focus
+    static SDL_atomic_t hdrfailed, swaperror, swapstalled, windowactive;
     static PFN_vkSetHdrMetadataEXT SetHdrMetadataEXT = NULL;
     #define HDRFORMAT VK_FORMAT_A2B10G10R10_UNORM_PACK32 // what the HDR images are, the swapchain's may be its BGR twin
 
@@ -549,8 +554,10 @@ namespace vk
         queueidle();
         SDL_AtomicSet(&swapdirty, 0);
 
+        // the presenting thread calls this, so errors are left for the main thread to report rather than printed
         VkSurfaceCapabilitiesKHR caps;
-        VKCHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physdev, surface, &caps));
+        VkResult capsres = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physdev, surface, &caps);
+        if(capsres != VK_SUCCESS) { SDL_AtomicSet(&swaperror, int(capsres)); return false; }
         VkExtent2D extent = caps.currentExtent;
         if(extent.width == UINT32_MAX)
         {
@@ -609,7 +616,7 @@ namespace vk
 
         if(!(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         {
-            conoutf(colourred, "Vulkan: the swapchain can't be copied into");
+            SDL_AtomicSet(&swaperror, int(VK_ERROR_FORMAT_NOT_SUPPORTED));
             return false;
         }
         // with vsync every image beyond the one shown and the one being drawn is a frame of latency, so low latency keeps
@@ -638,7 +645,23 @@ namespace vk
         lci.latencyModeEnable = VK_TRUE;
         if(haslowlatency) sci.pNext = &lci;
         VkSwapchainKHR newswapchain = VK_NULL_HANDLE;
-        VKCHECK(vkCreateSwapchainKHR(device, &sci, NULL, &newswapchain));
+        VkResult created = dbgvkhdrfail == 1 && ishdrformat(format) ? VK_ERROR_INITIALIZATION_FAILED : vkCreateSwapchainKHR(device, &sci, NULL, &newswapchain);
+        if(created != VK_SUCCESS)
+        {
+            // the old swapchain is retired even so, and can't show anything more: it goes
+            if(swaplock) SDL_LockMutex(swaplock);
+            destroyswapchain();
+            if(swaplock) SDL_UnlockMutex(swaplock);
+            SDL_AtomicSet(&swaperror, int(created));
+            if(ishdrformat(format))
+            {
+                // the display offered HDR but wouldn't take it: SDR, and HDR output goes off
+                SDL_AtomicSet(&hdrfailed, 1);
+                swapwanthdr = false;
+                return createswapchain();
+            }
+            return false;
+        }
         if(swaplock) SDL_LockMutex(swaplock);
         destroyswapchain();
         swapchain = newswapchain;
@@ -850,16 +873,16 @@ namespace vk
         presentnext = (presentnext+1)%PRESENTRING;
         vkWaitForFences(device, 1, &p.fence, VK_TRUE, UINT64_MAX);
 
-        if(hdrimage != swapwanthdr)
+        if(hdrimage != swapwanthdr && !(hdrimage && SDL_AtomicGet(&hdrfailed)))
         {
             // the swapchain follows what's presented
             swapwanthdr = hdrimage;
             SDL_AtomicSet(&swapdirty, 1);
         }
-        if(SDL_AtomicGet(&swapdirty) && !createswapchain()) fprintf(stderr, "Vulkan: could not remake the swapchain\n");
+        if(SDL_AtomicGet(&swapdirty)) createswapchain();
         if(swaphdr && SDL_AtomicGet(&hdrmetadirty)) sethdrmetadata();
         uint32_t index = UINT32_MAX;
-        if(swapchain)
+        if(swapchain && !(dbgvkhdrfail == 2 && swaphdr)) // the test of a display that never gives an HDR image back
         {
             VkResult r = acquireimage(p.acquired, index);
             if(r == VK_ERROR_OUT_OF_DATE_KHR)
@@ -869,6 +892,32 @@ namespace vk
             }
             if(r == VK_SUBOPTIMAL_KHR) SDL_AtomicSet(&swapdirty, 1);
             else if(r != VK_SUCCESS) index = UINT32_MAX;
+        }
+        // an HDR frame left over from before HDR went off would show washed out on an SDR swapchain
+        if(hdrimage && !swaphdr) index = UINT32_MAX;
+
+        // a window with focus that stops getting images (a hidden one may, with vsync) has a swapchain the display let
+        // go of: after a second it is made again, after three in HDR, HDR is given up
+        static double stallstart = 0;
+        static bool stallremade = false;
+        if(index != UINT32_MAX || !SDL_AtomicGet(&windowactive)) { stallstart = 0; stallremade = false; }
+        else
+        {
+            double now = seconds();
+            if(!stallstart) stallstart = now;
+            else if(now - stallstart > 1 && !stallremade)
+            {
+                stallremade = true;
+                SDL_AtomicSet(&swapstalled, 1);
+                SDL_AtomicSet(&swapdirty, 1);
+            }
+            else if(now - stallstart > 3 && swaphdr)
+            {
+                SDL_AtomicSet(&hdrfailed, 1);
+                swapwanthdr = false;
+                SDL_AtomicSet(&swapdirty, 1);
+                stallstart = 0;
+            }
         }
         if(index == UINT32_MAX && !real) return; // nowhere to show it
 
@@ -1735,6 +1784,7 @@ void vk_shutdown()
     vkactive = false;
     hdrscreen = swaphdr = swapwanthdr = false;
     SDL_AtomicSet(&hdrsurface, 0);
+    SDL_AtomicSet(&hdrfailed, 0);
     SetHdrMetadataEXT = NULL;
     gvelocity = 0;
     velvpvalid = false;
@@ -2175,11 +2225,22 @@ void vk_setvsync(int vsync, int tear)
 bool vk_hastear() { return hasrelaxed; }
 
 // 1 when the display takes HDR10 (the window's surface offers it), 2 when it's on
-ICOMMANDV(0, hdravailable, vkactive && SDL_AtomicGet(&hdrsurface) ? (hdrscreen ? 2 : 1) : 0);
+ICOMMANDV(0, hdravailable, vkactive && SDL_AtomicGet(&hdrsurface) && !SDL_AtomicGet(&hdrfailed) ? (hdrscreen ? 2 : 1) : 0);
 
 void vk_updatehdr()
 {
-    bool want = vkactive && hdroutput && SDL_AtomicGet(&hdrsurface);
+    if(!vkactive) return;
+    SDL_AtomicSet(&windowactive, !minimized && screen && (SDL_GetWindowFlags(screen)&SDL_WINDOW_INPUT_FOCUS) ? 1 : 0);
+    int err = SDL_AtomicSet(&swaperror, 0);
+    if(err) conoutf(colourred, "Vulkan: could not make the swapchain: %s (%d)", resultname(VkResult(err)), err);
+    if(SDL_AtomicSet(&swapstalled, 0)) conoutf(colouryellow, "Vulkan: the display stopped taking frames, the swapchain was made again");
+    if(SDL_AtomicGet(&hdrfailed) && hdroutput)
+    {
+        // off for good, so the next start doesn't run into it again
+        setvar("hdroutput", 0, true);
+        conoutf(colourred, "Vulkan: the display wouldn't show HDR output, it is off now");
+    }
+    bool want = hdroutput && SDL_AtomicGet(&hdrsurface) && !SDL_AtomicGet(&hdrfailed);
     if(want == hdrscreen) return;
     hdrscreen = want;
     // the screen images and every buffer the tonemapped frame passes through change format
