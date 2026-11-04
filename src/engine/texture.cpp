@@ -3663,7 +3663,7 @@ static bool replaceslot(const char *name, int rot, int xoffset, int yoffset, flo
 
 // heights made from the slopes of the normal maps that have none (data/pbr/tools/normal_to_height.py): a slot using one
 // gets it as its depth and the parallax version of its shader as it loads, and saving the map keeps what it defined
-VAR(IDF_PERSIST, autoheights, 0, 1, 1); // takes effect as maps load
+VAR(IDF_PERSIST, autoheights, 0, 0, 1); // off by default: on busy textures the guessed heights make more swimming than depth; takes effect as maps load
 FVAR(IDF_PERSIST, autoheightscale, 0, 1, 4); // how deep they go against what their normal maps show, as maps load
 struct autoheight { float depth, rest, aspect; };
 static hashtable<const char *, autoheight> autoheightmaps;
