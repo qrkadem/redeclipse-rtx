@@ -2352,6 +2352,8 @@ void gl_drawview()
     shadegbuffer();
     GLERROR;
 
+    if(!fogmat) renderheighthaze();
+
     if(fogmat)
     {
         setfog(fogmat, fogbelow, 1, abovemat);

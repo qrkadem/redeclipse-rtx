@@ -60,6 +60,14 @@ FVAR(IDF_PERSIST, rtgiscale, 0, 1, 4);           // how strong the indirect ligh
 // reaches no shade of the sun and is far weaker under a low sun, so traced sky floods shade on maps like octavus
 VARF(IDF_PERSIST, rtgiskytrace, 0, 0, 1, rtgichanged());
 FVAR(IDF_PERSIST, rtgisky, 0, 1, 4);             // how strong the traced sky's light is
+// light as it would really fall: the maps' flat ambient light, which every surface gets the same of, is all but gone,
+// so shade is lit only by what bounces into it and the sky it sees; the sky is traced, its colour the map's but its
+// strength a share of the sun's, as a clear sky's is (the maps' sky light was set for the radiance hints, far too bright)
+VARF(IDF_PERSIST, rtgiphysical, 0, 0, 1, rtgichanged());
+FVAR(IDF_PERSIST, rtgiphysambient, 0, 0.25f, 1); // how much of the flat ambient light is left
+// the open sky's light on the ground against the sun's straight on, in the engine's lighting values: those are
+// gamma encoded, so this is about the square root of the share in real light (0.6 for about a third)
+FVAR(IDF_PERSIST, rtgiphyssky, 0, 0.6f, 2);
 FVAR(IDF_PERSIST, rtgidist, 16, 2048, 65536);    // farthest an indirect light ray looks
 VAR(IDF_PERSIST, rtgihistory, 1, 32, 128);       // most frames a surface's indirect light is averaged over
 VAR(IDF_PERSIST, rtgifilter, 0, 3, 5);           // filter passes over the indirect light, each reaching twice as far
@@ -1942,7 +1950,10 @@ void vkrt_newmap() { rtnewmap = true; }
 
 bool vkrt_reflavailable() { return rtrefl && vkactive && hasrt && !rtfailed && !rffailed; }
 bool vkrt_giavailable() { return rtgi && vkactive && hasrt && !rtfailed && !rffailed; }
-bool vkrt_giskytraced() { return rtgiskytrace != 0; }
+bool vkrt_giskytraced() { return rtgiskytrace || rtgiphysical; }
+bool vkrt_giphysical() { return rtgiphysical && vkrt_giavailable(); }
+float vkrt_ambientscale() { return vkrt_giphysical() ? rtgiphysambient : 1.0f; }
+float vkrt_physskyscale() { return rtgiphyssky; }
 
 // the lighting shaders change with it, and the scene needs its textures to light what the rays hit
 static void rtgichanged()

@@ -1074,6 +1074,17 @@ FVAR(IDF_PERSIST, hdrbrightscale, 0.1f, 1.0f, 3.0f);
 FVAR(0, hdrsaturate, 1e-3f, 0.9f, 1e3f);
 FVAR(0, hdrminexposure, 0, 0.03f, 1);
 FVAR(0, hdrmaxexposure, 0, 0.3f, 1);
+// the curve light is mapped to the screen by: 0 the classic one (each pixel's brightness alone, colour kept as it is),
+// 1 AgX, 2 ACES; the filmic two give shade a toe and run bright colours to white, as film and modern games do. HDR
+// output takes the classic curve back apart to find the light, so it keeps that one
+VAR(IDF_PERSIST, tonemap, 0, 0, 2);
+FVAR(IDF_PERSIST, tonemapexposure, 0.1f, 1, 4);   // the filmic curves' brightness, 1 about the classic curve's in midtones
+FVAR(IDF_PERSIST, tonemapcontrast, 0.5f, 1, 2);  // the filmic curves' contrast, as a power on the display's values
+FVAR(IDF_PERSIST, tonemapsaturation, 0, 1, 2);    // the filmic curves' saturation
+FVAR(IDF_PERSIST, tonemapadapt, 0, 0.6f, 2);      // how much more the filmic curves adapt to the view's brightness than the classic curve
+FVAR(0, tonemapadaptref, 0.01f, 0.3f, 4);         // the view brightness the filmic curves' own adaptation leaves alone
+FVAR(0, tonemapadaptmin, 0.1f, 0.5f, 1);          // the most it darkens
+FVAR(0, tonemapadaptmax, 1, 2, 16);               // the most it brightens
 VARF(IDF_PERSIST, gscale, 25, 100, 100, cleanupgbuffer());
 VARF(IDF_PERSIST, gscalecubic, 0, 0, 1, cleanupgbuffer());
 VARF(IDF_PERSIST, gscalenearest, -1, -1, 1, cleanupgbuffer());
@@ -1150,6 +1161,11 @@ void processhdr(GLuint outfbo, int aa)
 
     float bright = gethdrbright() * hdrbrightscale;
     GLOBALPARAMF(hdrparams, bright, hdrsaturate, bloom ? bloomthreshold : 0.f, bloom ? bloomscale : 0.f);
+    // the filmic curves take light about 0.62 (AgX, with its look) and 0.46 (ACES) as bright as the classic one, for
+    // about the same brightness in midtones
+    int curve = hdrscreen ? 0 : tonemap;
+    GLOBALPARAMF(tonemapparams, curve, tonemapexposure*(curve == 1 ? 0.62f : 0.455f), tonemapsaturation, tonemapcontrast);
+    GLOBALPARAMF(tonemapadapt, tonemapadapt, tonemapadaptref, tonemapadaptmin, tonemapadaptmax);
 
     GLuint b0fbo = bloomfbo[1], b0tex = bloomtex[1], b1fbo =  bloomfbo[0], b1tex = bloomtex[0], ptex = hdrtex;
     int b0w = max(vieww/4, bloomw), b0h = max(viewh/4, bloomh), b1w = max(vieww/2, bloomw), b1h = max(viewh/2, bloomh),
@@ -3180,7 +3196,7 @@ static inline void setlightglobals(bool transparent = false)
     else
     {
         bvec curambient = worldcols[WORLDCOL_F_AMBIENT];
-        float curambientscale = getambientscale();
+        float curambientscale = getambientscale()*vkrt_ambientscale();
         GLOBALPARAMF(lightscale, curambient.x*lightscale*curambientscale, curambient.y*lightscale*curambientscale, curambient.z*lightscale*curambientscale, 255*lightscale);
     }
 
@@ -5620,7 +5636,7 @@ void getrtshading(rtshading &s, vector<rtlight> &rl)
 {
     float lightscale = 2.0f*ldrscaleb;
     bvec amb = worldcols[WORLDCOL_F_AMBIENT], pie = worldcols[WORLDCOL_F_SUNLIGHT];
-    s.ambient = vec(amb.x, amb.y, amb.z).mul(lightscale*getambientscale());
+    s.ambient = vec(amb.x, amb.y, amb.z).mul(lightscale*getambientscale()*vkrt_ambientscale());
     s.glowscale = 255*lightscale;
     s.sun = !pie.iszero() && getpielightscale() > 0;
     s.suncolor = vec(pie.x, pie.y, pie.z).mul(lightscale*getpielightscale());
@@ -5632,6 +5648,15 @@ void getrtshading(rtshading &s, vector<rtlight> &rl)
     {
         bvec piesky = getskylight();
         s.skycolor = vec(piesky.x, piesky.y, piesky.z).mul(0.24f*2*getgiaoscale()*lightscale*getskylightscale());
+        if(vkrt_giphysical())
+        {
+            // the map's sky colour, or its ambient's without one, at a share of the sun's brightness
+            vec hue = s.skycolor;
+            if(hue.iszero()) hue = vec(amb.x, amb.y, amb.z);
+            if(hue.iszero()) hue = vec(1, 1, 1);
+            const vec lum(0.2126f, 0.7152f, 0.0722f);
+            s.skycolor = hue.mul(vkrt_physskyscale()*s.suncolor.dot(lum)/max(hue.dot(lum), 1e-4f));
+        }
     }
     else s.skycolor = vec(0, 0, 0);
     s.fogcolor = curfogcolor;
@@ -5763,6 +5788,45 @@ void renderreflections()
     glDepthMask(depthwrite);
 
     endtimer(refltimer);
+}
+
+VAR(IDF_PERSIST, airhaze, 0, 0, 1);                  // height haze: distance fades into the map's fog colour, thickest low down
+FVAR(IDF_PERSIST, airhazedist, 256, 6000, 1e6f);     // how far light goes through the haze at the map's lowest ground before two thirds of it is lost
+FVAR(IDF_PERSIST, airhazeheight, 16, 512, 1e5f);     // how much higher the haze is a third as thick
+FVAR(IDF_PERSIST, airhazesun, 0, 0.15f, 4);          // how much the haze glows around the sun
+FVAR(IDF_PERSIST, airhazecolourscale, 0, 1, 4);      // how bright the haze's own colour (the map's fog colour) is
+
+void renderheighthaze()
+{
+    if(!airhaze || drawtex || msaalight) return;
+
+    glActiveTexture_(GL_TEXTURE0 + TEX_CURRENT_DEPTH);
+    glBindTexture(GL_TEXTURE_RECTANGLE, gdepthtex);
+    glActiveTexture_(GL_TEXTURE0);
+
+    float lightscale = 2.0f*ldrscaleb;
+    bvec pie = worldcols[WORLDCOL_F_SUNLIGHT];
+    vec suncolor = pie.iszero() ? vec(0, 0, 0) : vec(pie.x, pie.y, pie.z).mul(lightscale*getpielightscale());
+    // the haze is thickest at the height players start at, as maps often have geometry far below where they're played
+    float base = 0;
+    int starts = 0;
+    const vector<extentity *> &ents = entities::getents();
+    loopv(ents) if(ents[i]->type == ET_PLAYERSTART) { base += ents[i]->o.z; starts++; }
+    base = starts ? base/starts : float(worldmin.z);
+    GLOBALPARAMF(hazeparams, 1.0f/airhazedist, 1.0f/airhazeheight, base, airhazesun);
+    GLOBALPARAM(hazecolor, vec(curfogcolor).mul(airhazecolourscale));
+    GLOBALPARAM(hazesundir, getpielightdir());
+    GLOBALPARAM(hazesuncolor, suncolor);
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    SETSHADER(heighthaze);
+    screenquad();
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
 }
 
 void shadegbuffer()

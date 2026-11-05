@@ -103,6 +103,9 @@ extern bool vkrt_reflavailable();
 // is none this frame
 extern GLuint vkrt_reflect(GLuint litfbo, int w, int h);
 extern bool vkrt_giskytraced(); // the sky's light is in the traced indirect light, not the radiance hints'
+extern bool vkrt_giphysical();   // physical lighting: no flat ambient light, the sky's strength from the sun's
+extern float vkrt_ambientscale(); // how much of the maps' flat ambient light is kept
+extern float vkrt_physskyscale(); // under physical lighting, the open sky's light against the sun's
 extern bool vkrt_giavailable();  // ray traced indirect light is wanted and possible: picks the lighting shaders
 extern GLuint vkrt_gitexture();  // the indirect light reaching each pixel, black when none was traced this frame
 extern void vkrt_cleanupgl();
