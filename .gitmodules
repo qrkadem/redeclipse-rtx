@@ -16,7 +16,7 @@
 	branch = master
 [submodule "dc"]
 	path = data/dc
-	url = https://github.com/redeclipse/dc.git
+	url = https://github.com/qrkadem/redeclipse-dc.git
 [submodule "decals"]
 	path = data/decals
 	url = https://github.com/redeclipse/decals.git
